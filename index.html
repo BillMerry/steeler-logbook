@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>STEELER Logbook</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="styles.css" />
+
+  <!-- PWA bits (for later HTTPS hosting) -->
+  <link rel="manifest" href="manifest.json">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="STEELER Logbook">
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-top">
+      <h1>STEELER Logbook</h1>
+      <button id="themeToggleBtn" class="secondary-btn small theme-toggle">Night</button>
+    </div>
+    <div class="header-bottom">
+      <div id="headerPassageMain" class="header-main"></div>
+      <div class="header-right">
+        <div id="headerSunrise" class="header-sunrise"></div>
+        <div id="headerCrew" class="header-crew"></div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- Tabs -->
+    <nav class="tabs">
+      <button class="tab-btn active" data-tab="homeTab">Home</button>
+      <button class="tab-btn" data-tab="planTab">Plan</button>
+      <button class="tab-btn" data-tab="logTab">Log</button>
+    </nav>
+
+    <!-- HOME TAB -->
+    <section id="homeTab" class="tab active">
+      <section class="home-actions">
+        <button id="homeNewPassageBtn" class="primary-btn">+ New Passage</button>
+      </section>
+
+      <section class="home-passages">
+        <h2>Passages</h2>
+        <div id="homePassageList" class="passage-list"></div>
+      </section>
+    </section>
+
+    <!-- PLAN TAB -->
+    <section id="planTab" class="tab">
+      <form id="planForm" class="form">
+        <h2>Passage Plan</h2>
+
+        <div class="row row-date">
+          <label class="date-field">
+            Date
+            <input type="date" id="planDate" required />
+          </label>
+
+          <label class="sunrise-field">
+            Sunrise / Sunset
+            <input type="text" id="planSunriseSet"
+                   placeholder="e.g. 05:12 / 21:18 (BST)" />
+          </label>
+        </div>
+
+        <div class="row">
+          <label>
+            Origin
+            <input type="text" id="planFrom" placeholder="e.g. St Peter Port" list="portsList" />
+          </label>
+          <label>
+            Intended Destination
+            <input type="text" id="planTo" placeholder="e.g. Lymington" list="portsList" />
+          </label>
+        </div>
+
+        <datalist id="portsList"></datalist>
+
+        <div class="row">
+          <label>
+            Vessel
+            <input type="text" id="planVessel" value="STEELER" />
+          </label>
+          <label>
+            Skipper
+            <input type="text" id="planSkipper" placeholder="e.g. Bill" />
+          </label>
+        </div>
+
+        <label>
+          Crew
+          <input type="text" id="planCrew" placeholder="Names (optional)" />
+        </label>
+
+        <h3>Tides</h3>
+        <div class="row">
+          <label>
+            Tidal Coefficient
+            <input type="text" id="planTidalCoeff" placeholder="e.g. Neaps +2 / 85%" />
+          </label>
+        </div>
+
+        <div class="tide-stations-header">
+          <h4>Tide Stations</h4>
+          <button type="button" id="addTideStationBtn" class="secondary-btn small">
+            + Add Station
+          </button>
+        </div>
+        <div id="tideStationsContainer"></div>
+
+        <h3>Tidal Currents / Flows</h3>
+        <textarea id="planCurrents" rows="3"
+          placeholder="Notes on tidal streams, overfalls, gates, etc."></textarea>
+
+        <h3>Weather (Inshore Waters)</h3>
+        <textarea id="planWeather" rows="4"
+          placeholder="Met Office Inshore Waters forecast summary (now + next 24h)..."></textarea>
+
+        <h3>Comms / Pilotage Notes</h3>
+        <textarea id="planComms" rows="4"
+          placeholder="VHF channels, phone numbers, pilotage notes, hazards..."></textarea>
+
+        <h3>Daily Summary</h3>
+        <div id="dailySummariesContainer"></div>
+        <button type="button" id="addDailySummaryBtn" class="secondary-btn small">
+          + Add Day
+        </button>
+
+        <button type="submit" class="primary-btn plan-save-btn">Save Plan</button>
+      </form>
+    </section>
+
+    <!-- LOG TAB -->
+    <section id="logTab" class="tab">
+      <div class="log-header">
+        <div class="log-header-left">
+          <button id="addEntryBtn" class="primary-btn">+ New Log Entry</button>
+          <button id="engineStartBtn" class="secondary-btn small">Engine start</button>
+          <button id="slipLinesBtn" class="secondary-btn small">Slip</button>
+          <button id="dockLinesBtn" class="secondary-btn small">Dock</button>
+          <button id="shutdownBtn" class="secondary-btn small">Shutdown</button>
+        </div>
+        <div class="log-header-right">
+          <button id="splitViewBtn" class="secondary-btn small">Split view</button>
+          <button id="expandPlanBtn" class="secondary-btn small">Plan full</button>
+          <button id="expandLogBtn" class="secondary-btn small">Log full</button>
+          <button id="exportCsvBtn" class="secondary-btn small">Export CSV</button>
+        </div>
+      </div>
+
+      <div class="log-layout split" id="logLayout">
+        <!-- LEFT: Passage plan summary -->
+        <aside class="plan-summary scroll-pane" id="planSummaryPanel">
+          <!-- Filled by JS -->
+        </aside>
+
+        <!-- RIGHT: Running log table -->
+        <section class="log-table-wrapper scroll-pane">
+          <table class="log-table">
+            <thead>
+              <tr>
+                <th rowspan="2">TIME</th>
+                <th rowspan="2">COG</th>
+                <th rowspan="2">SPEED</th>
+                <th rowspan="2">RPM</th>
+                <th rowspan="2">ENG T/P</th>
+                <th colspan="2">LOG</th>
+                <th rowspan="2">FUEL USED</th>
+                <th rowspan="2">NOTES / ACTIONS</th>
+              </tr>
+              <tr>
+                <th>W</th>
+                <th>G</th>
+              </tr>
+            </thead>
+            <tbody id="logEntriesContainer"></tbody>
+          </table>
+          <div id="logSummaryPanel" class="log-summary"></div>
+          <p id="logEmptyMessage" class="log-empty">
+            No log entries yet. Tap “+ New Log Entry”.
+          </p>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <small>Data stored locally on this device · STEELER Logbook v0.4.1 (dev)</small>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
