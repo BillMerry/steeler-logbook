@@ -6,7 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="styles.css" />
 
-  <!-- PWA bits (for later HTTPS hosting) -->
+  <!-- PWA bits -->
   <link rel="manifest" href="manifest.json">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
@@ -16,34 +16,49 @@
   <header class="app-header">
     <div class="header-top">
       <h1>STEELER Logbook</h1>
-      <button id="themeToggleBtn" class="secondary-btn small theme-toggle">Night</button>
+      <button id="themeToggleBtn" class="btn btn-secondary btn-small">Night</button>
     </div>
+
     <div class="header-bottom">
-      <div id="headerPassageMain" class="header-main"></div>
+      <div class="header-leftline">
+        <div id="headerPassageMain" class="header-main"></div>
+        <div id="headerSunrise" class="header-sunrise-inline"></div>
+      </div>
+
       <div class="header-right">
-        <div id="headerSunrise" class="header-sunrise"></div>
         <div id="headerCrew" class="header-crew"></div>
       </div>
     </div>
-  </header>
 
-  <main>
-    <!-- Tabs -->
     <nav class="tabs">
       <button class="tab-btn active" data-tab="homeTab">Home</button>
       <button class="tab-btn" data-tab="planTab">Plan</button>
       <button class="tab-btn" data-tab="logTab">Log</button>
     </nav>
+  </header>
 
+  <main>
     <!-- HOME TAB -->
     <section id="homeTab" class="tab active">
       <section class="home-actions">
-        <button id="homeNewPassageBtn" class="primary-btn">+ New Passage</button>
+        <button id="homeNewPassageBtn" class="btn btn-primary">+ New Passage</button>
       </section>
 
       <section class="home-passages">
         <h2>Passages</h2>
         <div id="homePassageList" class="passage-list"></div>
+      </section>
+
+      <section class="home-backup">
+        <h2>Backup &amp; Restore</h2>
+        <div class="backup-row">
+          <button id="exportBackupBtn" class="btn btn-secondary">Backup</button>
+          <button id="importBackupBtn" class="btn btn-secondary">Restore</button>
+          <input id="importFileInput" type="file" accept="application/json,.json" hidden>
+        </div>
+        <p class="hint">
+          Tip: back up before longer trips. Restore replaces current data on this device.
+        </p>
       </section>
     </section>
 
@@ -53,19 +68,18 @@
         <h2>Passage Plan</h2>
 
         <div class="row row-date">
-          <label class="date-field">
+          <label class="field-compact">
             Date
             <input type="date" id="planDate" required />
           </label>
 
-          <label class="sunrise-field">
+          <label class="field-compact">
             Sunrise / Sunset
-            <input type="text" id="planSunriseSet"
-                   placeholder="e.g. 05:12 / 21:18 (BST)" />
+            <input type="text" id="planSunriseSet" placeholder="e.g. 05:12 / 21:18 (BST)" />
           </label>
         </div>
 
-        <div class="row">
+        <div class="grid-2">
           <label>
             Origin
             <input type="text" id="planFrom" placeholder="e.g. St Peter Port" list="portsList" />
@@ -74,11 +88,7 @@
             Intended Destination
             <input type="text" id="planTo" placeholder="e.g. Lymington" list="portsList" />
           </label>
-        </div>
 
-        <datalist id="portsList"></datalist>
-
-        <div class="row">
           <label>
             Vessel
             <input type="text" id="planVessel" value="STEELER" />
@@ -87,15 +97,17 @@
             Skipper
             <input type="text" id="planSkipper" placeholder="e.g. Bill" />
           </label>
+
+          <label class="grid-span-2">
+            Crew
+            <input type="text" id="planCrew" placeholder="Names (optional)" />
+          </label>
         </div>
 
-        <label>
-          Crew
-          <input type="text" id="planCrew" placeholder="Names (optional)" />
-        </label>
+        <datalist id="portsList"></datalist>
 
         <h3>Tides</h3>
-        <div class="row">
+        <div class="grid-2">
           <label>
             Tidal Coefficient
             <input type="text" id="planTidalCoeff" placeholder="e.g. Neaps +2 / 85%" />
@@ -104,31 +116,28 @@
 
         <div class="tide-stations-header">
           <h4>Tide Stations</h4>
-          <button type="button" id="addTideStationBtn" class="secondary-btn small">
+          <button type="button" id="addTideStationBtn" class="btn btn-secondary btn-small">
             + Add Station
           </button>
         </div>
-        <div id="tideStationsContainer"></div>
+        <div id="tideStationsContainer" class="grid-container"></div>
 
         <h3>Tidal Currents / Flows</h3>
-        <textarea id="planCurrents" rows="3"
-          placeholder="Notes on tidal streams, overfalls, gates, etc."></textarea>
+        <textarea id="planCurrents" rows="3" placeholder="Notes on tidal streams, overfalls, gates, etc."></textarea>
 
         <h3>Weather (Inshore Waters)</h3>
-        <textarea id="planWeather" rows="4"
-          placeholder="Met Office Inshore Waters forecast summary (now + next 24h)..."></textarea>
+        <textarea id="planWeather" rows="4" placeholder="Met Office Inshore Waters forecast summary..."></textarea>
 
         <h3>Comms / Pilotage Notes</h3>
-        <textarea id="planComms" rows="4"
-          placeholder="VHF channels, phone numbers, pilotage notes, hazards..."></textarea>
+        <textarea id="planComms" rows="4" placeholder="VHF channels, phone numbers, pilotage notes..."></textarea>
 
         <h3>Daily Summary</h3>
-        <div id="dailySummariesContainer"></div>
-        <button type="button" id="addDailySummaryBtn" class="secondary-btn small">
+        <div id="dailySummariesContainer" class="grid-container ds-grid"></div>
+        <button type="button" id="addDailySummaryBtn" class="btn btn-secondary btn-small">
           + Add Day
         </button>
 
-        <button type="submit" class="primary-btn plan-save-btn">Save Plan</button>
+        <button type="submit" class="btn btn-primary plan-save-btn">Save Plan</button>
       </form>
     </section>
 
@@ -136,27 +145,23 @@
     <section id="logTab" class="tab">
       <div class="log-header">
         <div class="log-header-left">
-          <button id="addEntryBtn" class="primary-btn">+ New Log Entry</button>
-          <button id="engineStartBtn" class="secondary-btn small">Engine start</button>
-          <button id="slipLinesBtn" class="secondary-btn small">Slip</button>
-          <button id="dockLinesBtn" class="secondary-btn small">Dock</button>
-          <button id="shutdownBtn" class="secondary-btn small">Shutdown</button>
+          <button id="addEntryBtn" class="btn btn-primary">+ New Log Entry</button>
+          <button id="engineStartBtn" class="btn btn-secondary btn-small">Engine start</button>
+          <button id="slipLinesBtn" class="btn btn-secondary btn-small">Slip</button>
+          <button id="dockLinesBtn" class="btn btn-secondary btn-small">Dock</button>
+          <button id="shutdownBtn" class="btn btn-secondary btn-small">Shutdown</button>
         </div>
         <div class="log-header-right">
-          <button id="splitViewBtn" class="secondary-btn small">Split view</button>
-          <button id="expandPlanBtn" class="secondary-btn small">Plan full</button>
-          <button id="expandLogBtn" class="secondary-btn small">Log full</button>
-          <button id="exportCsvBtn" class="secondary-btn small">Export CSV</button>
+          <button id="splitViewBtn" class="btn btn-secondary btn-small view-btn active">Split view</button>
+          <button id="expandPlanBtn" class="btn btn-secondary btn-small view-btn">Plan full</button>
+          <button id="expandLogBtn" class="btn btn-secondary btn-small view-btn">Log full</button>
+          <button id="exportCsvBtn" class="btn btn-secondary btn-small">Export CSV</button>
         </div>
       </div>
 
       <div class="log-layout split" id="logLayout">
-        <!-- LEFT: Passage plan summary -->
-        <aside class="plan-summary scroll-pane" id="planSummaryPanel">
-          <!-- Filled by JS -->
-        </aside>
+        <aside class="plan-summary scroll-pane" id="planSummaryPanel"></aside>
 
-        <!-- RIGHT: Running log table -->
         <section class="log-table-wrapper scroll-pane">
           <table class="log-table">
             <thead>
@@ -177,6 +182,7 @@
             </thead>
             <tbody id="logEntriesContainer"></tbody>
           </table>
+
           <div id="logSummaryPanel" class="log-summary"></div>
           <p id="logEmptyMessage" class="log-empty">
             No log entries yet. Tap “+ New Log Entry”.
@@ -186,8 +192,20 @@
     </section>
   </main>
 
+  <!-- Modal (numeric-friendly) -->
+  <div id="modalOverlay" class="modal-overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+      <div class="modal-title" id="modalTitle">Modal</div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-actions">
+        <button id="modalCancelBtn" class="btn btn-secondary">Cancel</button>
+        <button id="modalOkBtn" class="btn btn-primary">OK</button>
+      </div>
+    </div>
+  </div>
+
   <footer class="app-footer">
-    <small>Data stored locally on this device · STEELER Logbook v0.4.2 (dev)</small>
+    <small>Data stored locally on this device · STEELER Logbook v0.4.4</small>
   </footer>
 
   <script src="app.js"></script>
