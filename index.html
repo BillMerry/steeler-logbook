@@ -34,6 +34,7 @@
       <button class="tab-btn active" data-tab="homeTab">Home</button>
       <button class="tab-btn" data-tab="planTab">Plan</button>
       <button class="tab-btn" data-tab="logTab">Log</button>
+      <button class="tab-btn" data-tab="settingsTab">Settings</button>
     </nav>
   </header>
 
@@ -48,19 +49,10 @@
         <h2>Passages</h2>
         <div id="homePassageList" class="passage-list"></div>
       </section>
-
-      <section class="home-backup">
-        <h2>Backup &amp; Restore</h2>
-        <div class="backup-row">
-          <button id="exportBackupBtn" class="btn btn-secondary">Backup</button>
-          <button id="importBackupBtn" class="btn btn-secondary">Restore</button>
-          <input id="importFileInput" type="file" accept="application/json,.json" hidden>
-        </div>
-        <p class="hint">
-          Tip: back up before longer trips. Restore replaces current data on this device.
-        </p>
+      <section class="home-hint">
+        <p class="hint">Tip: Backup/Restore and port management live under <strong>Settings</strong>.</p>
       </section>
-    </section>
+</section>
 
     <!-- PLAN TAB -->
     <section id="planTab" class="tab">
@@ -82,11 +74,13 @@
         <div class="grid-2">
           <label>
             Origin
-            <input type="text" id="planFrom" placeholder="e.g. St Peter Port" list="portsList" />
+            <input type="text" id="planFrom" placeholder="e.g. St Peter Port" autocomplete="off" />
+            <div id="planFromSuggest" class="port-suggest hidden"></div>
           </label>
           <label>
             Intended Destination
-            <input type="text" id="planTo" placeholder="e.g. Lymington" list="portsList" />
+            <input type="text" id="planTo" placeholder="e.g. Lymington" autocomplete="off" />
+            <div id="planToSuggest" class="port-suggest hidden"></div>
           </label>
 
           <label>
@@ -103,10 +97,7 @@
             <input type="text" id="planCrew" placeholder="Names (optional)" />
           </label>
         </div>
-
-        <datalist id="portsList"></datalist>
-
-        <h3>Tides</h3>
+<h3>Tides</h3>
         <div class="grid-2">
           <label>
             Tidal Coefficient
@@ -190,6 +181,32 @@
         </section>
       </div>
     </section>
+  
+    <!-- SETTINGS TAB -->
+    <section id="settingsTab" class="tab">
+      <section class="settings-section">
+        <h2>Settings</h2>
+
+        <div class="settings-card">
+          <h3>Backup &amp; Restore</h3>
+          <div class="backup-row">
+            <button id="exportBackupBtn" class="btn btn-secondary">Backup</button>
+            <button id="importBackupBtn" class="btn btn-secondary">Restore</button>
+            <input id="importFileInput" type="file" accept="application/json,.json" hidden>
+          </div>
+          <p class="hint">Restore replaces current data on this device.</p>
+        </div>
+
+        <div class="settings-card">
+          <h3>Ports</h3>
+          <div class="settings-row">
+            <button id="managePortsBtn" class="btn btn-secondary">Manage Ports</button>
+          </div>
+          <p class="hint">Add/remove ports and (optionally) store lat/long for Sunrise/Sunset calculations.</p>
+        </div>
+      </section>
+    </section>
+
   </main>
 
   <!-- Modal (numeric-friendly) -->
@@ -205,8 +222,24 @@
   </div>
 
   <footer class="app-footer">
-    <small>Data stored locally on this device · STEELER Logbook v0.4.4</small>
+    <small>Data stored locally on this device · STEELER Logbook v0.4.5</small>
   </footer>
+
+
+  <!-- Ports Manager Modal -->
+  <div id="portsModal" class="modal hidden" aria-hidden="true">
+    <div id="portsModalOverlay" class="modal-overlay hidden"></div>
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-label="Manage Ports">
+      <div class="modal-header">
+        <div class="modal-title">Manage Ports</div>
+        <button type="button" id="portsModalClose" class="modal-close" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-help">Remove typos/tests from the saved port list.</div>
+        <div id="portsManagerList" class="ports-list"></div>
+      </div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>

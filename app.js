@@ -7,6 +7,275 @@ const PORTS_KEY   = "steeler_logbook_ports_v1";
 let passages = [];
 let currentPassageId = null;
 let knownPorts = [];
+let recentPorts = [];
+const PORTS_RECENT_LIMIT = 20;
+
+
+
+
+function portName(p){
+  return (typeof p === "string") ? p : (p && typeof p === "object" ? (p.name || "") : "");
+}
+function portHasCoords(p){
+  return p && typeof p === "object" && !isNaN(p.lat) && !isNaN(p.lon);
+}
+function findPortItemByName(name){
+  const n = (name || "").trim();
+  if (!n) return null;
+  return knownPorts.find(p => portName(p) === n) || null;
+}
+function upsertPortItem(name, lat=null, lon=null){
+  const n = (name || "").trim();
+  if (!n) return;
+  const existingIdx = knownPorts.findIndex(p => portName(p) === n);
+  if (existingIdx >= 0){
+    const existing = knownPorts[existingIdx];
+    if (lat != null && lon != null){
+      knownPorts[existingIdx] = { name: n, lat: Number(lat), lon: Number(lon) };
+    } else {
+      knownPorts[existingIdx] = existing;
+    }
+  } else {
+    knownPorts.push((lat != null && lon != null) ? { name: n, lat: Number(lat), lon: Number(lon) } : n);
+  }
+  knownPorts.sort((a,b) => portName(a).localeCompare(portName(b)));
+}
+
+// --- Port autocomplete + management --------------------------------
+
+function getPortSuggestions(query) {
+  const q = (query || "").trim().toLowerCase();
+  let list;
+
+  if (!q) {
+    // show MRU first, then fall back to alphabetical if MRU empty
+    list = (recentPorts && recentPorts.length ? recentPorts.slice() : knownPorts.slice());
+  } else {
+    list = knownPorts.filter(p => portName(p).toLowerCase().includes(q));
+    // prefer starts-with matches
+    list.sort((a, b) => {
+      const aStart = a.toLowerCase().startsWith(q) ? 0 : 1;
+      const bStart = b.toLowerCase().startsWith(q) ? 0 : 1;
+      if (aStart !== bStart) return aStart - bStart;
+      return a.localeCompare(b);
+    });
+  }
+
+  // ensure unique
+  const seen = new Set();
+  const out = [];
+  for (const p of list) {
+    const name = portName(p);
+    if (!seen.has(name)) {
+      seen.add(name);
+      out.push(name);
+    }
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
+function renderPortSuggestBox(inputEl, boxEl) {
+  if (!inputEl || !boxEl) return;
+
+  const suggestions = getPortSuggestions(inputEl.value);
+  boxEl.innerHTML = "";
+
+  if (!suggestions.length) {
+    boxEl.classList.add("hidden");
+    return;
+  }
+
+  suggestions.forEach(name => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "port-suggest-item";
+    btn.textContent = name;
+    btn.addEventListener("mousedown", (e) => {
+      // mousedown so we beat blur
+      e.preventDefault();
+      inputEl.value = name;
+      rememberPort(name);
+      boxEl.classList.add("hidden");
+      // trigger any bound input handler
+      inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    boxEl.appendChild(btn);
+  });
+
+  boxEl.classList.remove("hidden");
+}
+
+function setupSinglePortAutocomplete(inputId, boxId) {
+  const inputEl = document.getElementById(inputId);
+  const boxEl = document.getElementById(boxId);
+  if (!inputEl || !boxEl) return;
+
+  const show = () => renderPortSuggestBox(inputEl, boxEl);
+  inputEl.addEventListener("input", show);
+  inputEl.addEventListener("focus", show);
+  inputEl.addEventListener("blur", () => {
+    // allow click selection
+    setTimeout(() => boxEl.classList.add("hidden"), 150);
+  });
+
+  // Escape hides
+  inputEl.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") boxEl.classList.add("hidden");
+  });
+}
+
+function setupPortAutocomplete() {
+  setupSinglePortAutocomplete("planFrom", "planFromSuggest");
+  setupSinglePortAutocomplete("planTo", "planToSuggest");
+}
+
+function deletePort(name) {
+  const trimmed = (name || "").trim();
+  if (!trimmed) return;
+  knownPorts = knownPorts.filter(p => portName(p) !== trimmed);
+  recentPorts = recentPorts.filter(p => p !== trimmed);
+  savePorts();
+  refreshPortUI();
+}
+
+
+function renderPortsManagerList() {
+  const list = document.getElementById("portsManagerList");
+  if (!list) return;
+  list.innerHTML = "";
+
+  const items = knownPorts.slice().sort((a, b) => portName(a).localeCompare(portName(b)));
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "ports-empty";
+    empty.textContent = "No saved ports yet.";
+    list.appendChild(empty);
+    return;
+  }
+
+  items.forEach(item => {
+    const name = portName(item);
+
+    const row = document.createElement("div");
+    row.className = "ports-row";
+
+    const left = document.createElement("div");
+    left.className = "ports-left";
+
+    const label = document.createElement("div");
+    label.className = "ports-name";
+    label.textContent = name;
+
+    const coords = document.createElement("div");
+    coords.className = "ports-coords";
+
+    const latInput = document.createElement("input");
+    latInput.type = "number";
+    latInput.inputMode = "decimal";
+    latInput.step = "0.0001";
+    latInput.placeholder = "Lat";
+    latInput.className = "ports-coord-input";
+    latInput.value = (item && typeof item === "object" && item.lat != null) ? item.lat : "";
+
+    const lonInput = document.createElement("input");
+    lonInput.type = "number";
+    lonInput.inputMode = "decimal";
+    lonInput.step = "0.0001";
+    lonInput.placeholder = "Lon";
+    lonInput.className = "ports-coord-input";
+    lonInput.value = (item && typeof item === "object" && item.lon != null) ? item.lon : "";
+
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "ports-mini";
+    saveBtn.textContent = "Save coords";
+    saveBtn.addEventListener("click", () => {
+      const lat = parseFloat(latInput.value);
+      const lon = parseFloat(lonInput.value);
+      if (isNaN(lat) || isNaN(lon)) {
+        alert("Please enter valid decimal lat and lon (e.g. 50.757, -1.545).");
+        return;
+      }
+      upsertPortItem(name, lat, lon);
+      savePorts();
+      renderPortsManagerList();
+      autoComputeSunriseSetForCurrent();
+    });
+
+    const lookupBtn = document.createElement("button");
+    lookupBtn.type = "button";
+    lookupBtn.className = "ports-mini";
+    lookupBtn.textContent = "Lookup";
+    lookupBtn.addEventListener("click", async () => {
+      try {
+        const q = encodeURIComponent(name + " port");
+        const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${q}`;
+        const res = await fetch(url, { headers: { "Accept": "application/json" } });
+        if (!res.ok) throw new Error("Lookup failed");
+        const data = await res.json();
+        if (!data || !data[0]) {
+          alert("No match found. Try manual lat/lon.");
+          return;
+        }
+        const lat = parseFloat(data[0].lat);
+        const lon = parseFloat(data[0].lon);
+        if (isNaN(lat) || isNaN(lon)) {
+          alert("Lookup returned invalid coordinates.");
+          return;
+        }
+        latInput.value = lat.toFixed(6);
+        lonInput.value = lon.toFixed(6);
+      } catch (e) {
+        console.error(e);
+        alert("Could not look up that port (offline or blocked). You can enter lat/lon manually.");
+      }
+    });
+
+    coords.appendChild(latInput);
+    coords.appendChild(lonInput);
+    coords.appendChild(saveBtn);
+    coords.appendChild(lookupBtn);
+
+    left.appendChild(label);
+    left.appendChild(coords);
+
+    const right = document.createElement("div");
+    right.className = "ports-right";
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "ports-delete";
+    del.textContent = "Remove";
+    del.addEventListener("click", () => deletePort(name));
+
+    right.appendChild(del);
+
+    row.appendChild(left);
+    row.appendChild(right);
+    list.appendChild(row);
+  });
+}
+
+
+function setupPortsManagerModal() {
+  const openBtn = document.getElementById("managePortsBtn");
+  const modal = document.getElementById("portsModal");
+  const closeBtn = document.getElementById("portsModalClose");
+  const overlay = document.getElementById("portsModalOverlay");
+
+  if (!openBtn || !modal) return;
+
+  const open = () => {
+    renderPortsManagerList();
+    modal.classList.remove("hidden");
+  };
+  const close = () => modal.classList.add("hidden");
+
+  openBtn.addEventListener("click", open);
+  if (closeBtn) closeBtn.addEventListener("click", close);
+  if (overlay) overlay.addEventListener("click", close);
+}
 
 // --- Storage helpers -----------------------------------------------
 
@@ -31,15 +300,32 @@ function savePassages() {
 function loadPorts() {
   try {
     const raw = localStorage.getItem(PORTS_KEY);
-    knownPorts = raw ? JSON.parse(raw) : [];
+    if (!raw) {
+      knownPorts = [];
+      recentPorts = [];
+      return;
+    }
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      knownPorts = parsed;
+      recentPorts = [];
+    } else if (parsed && typeof parsed === "object") {
+      knownPorts = Array.isArray(parsed.all) ? parsed.all : [];
+      recentPorts = Array.isArray(parsed.recent) ? parsed.recent : [];
+    } else {
+      knownPorts = [];
+      recentPorts = [];
+    }
   } catch {
     knownPorts = [];
+    recentPorts = [];
   }
 }
 
 function savePorts() {
   try {
-    localStorage.setItem(PORTS_KEY, JSON.stringify(knownPorts));
+    const payload = { all: knownPorts, recent: recentPorts };
+    localStorage.setItem(PORTS_KEY, JSON.stringify(payload));
   } catch (e) {
     console.warn("Failed to save ports", e);
   }
@@ -48,12 +334,20 @@ function savePorts() {
 function rememberPort(name) {
   const trimmed = (name || "").trim();
   if (!trimmed) return;
+
+  // Add to master list
   if (!knownPorts.includes(trimmed)) {
     knownPorts.push(trimmed);
     knownPorts.sort((a, b) => a.localeCompare(b));
-    savePorts();
-    renderPortsDatalist();
   }
+
+  // Update MRU list (most recent first)
+  recentPorts = recentPorts.filter(p => p !== trimmed);
+  recentPorts.unshift(trimmed);
+  if (recentPorts.length > PORTS_RECENT_LIMIT) recentPorts.length = PORTS_RECENT_LIMIT;
+
+  savePorts();
+  refreshPortUI();
 }
 
 // --- Small helpers -------------------------------------------------
@@ -226,17 +520,42 @@ function updatePassageHeader() {
   headerCrew.textContent = crewParts.join("  |  ");
 }
 
+
+function autoComputeSunriseSetForCurrent(){
+  const p = getCurrentPassage();
+  if (!p) return;
+  const date = (p.plan.date || planDate?.value || "").trim();
+  const from = (p.plan.from || planFrom?.value || "").trim();
+  const to   = (p.plan.to   || planTo?.value || "").trim();
+
+  const origin = getPortCoords(from);
+  const dest = isLocalDestination(to) ? origin : getPortCoords(to);
+
+  if (!date || !origin) return;
+
+  const sunRiseSet = calcSunTimes(date, origin.lat, origin.lon);
+  if (!sunRiseSet) return;
+
+  let sunset = sunRiseSet.sunset;
+  if (dest && dest !== origin){
+    const destSun = calcSunTimes(date, dest.lat, dest.lon);
+    if (destSun && destSun.sunset) sunset = destSun.sunset;
+  }
+
+  const val = `${sunRiseSet.sunrise} / ${sunset}`;
+  p.plan.sunriseSet = val;
+  if (planSunriseSet) planSunriseSet.value = val;
+  savePassages();
+  updatePassageHeader();
+  updatePlanSummaryPanel();
+}
+
 // --- Ports datalist -----------------------------------------------
 
-function renderPortsDatalist() {
-  const dl = document.getElementById("portsList");
-  if (!dl) return;
-  dl.innerHTML = "";
-  knownPorts.forEach(p => {
-    const opt = document.createElement("option");
-    opt.value = p;
-    dl.appendChild(opt);
-  });
+function refreshPortUI() {
+  // Hook for any UI elements that depend on the port list.
+  // (Autocomplete + Manage Ports modal)
+  renderPortsManagerList();
 }
 
 // --- Modal ---------------------------------------------------------
@@ -269,7 +588,7 @@ function exportBackup() {
     exportedAt: new Date().toISOString(),
     data: {
       passages,
-      knownPorts,
+      knownPorts: { all: knownPorts, recent: recentPorts },
       theme: localStorage.getItem(THEME_KEY) || "day"
     }
   };
@@ -304,7 +623,7 @@ function importBackupFile(file) {
         alert("That file doesn’t look like a STEELER Logbook backup.");
         return;
       }
-      if (!Array.isArray(obj.data.passages) || !Array.isArray(obj.data.knownPorts)) {
+      if (!Array.isArray(obj.data.passages) || !obj.data.knownPorts) {
         alert("Backup file is missing expected data.");
         return;
       }
@@ -312,10 +631,19 @@ function importBackupFile(file) {
       if (!ok) return;
 
       passages = obj.data.passages;
-      knownPorts = obj.data.knownPorts;
+
+      // Support both legacy (array) and current (object with {all,recent}) port backup formats (CL-071)
+      const portsPayload = obj.data.knownPorts;
+      if (Array.isArray(portsPayload)) {
+        knownPorts = portsPayload;
+        recentPorts = portsPayload.slice(0, 6);
+      } else {
+        knownPorts = Array.isArray(portsPayload.all) ? portsPayload.all : [];
+        recentPorts = Array.isArray(portsPayload.recent) ? portsPayload.recent : [];
+      }
 
       localStorage.setItem(STORAGE_KEY, JSON.stringify(passages));
-      localStorage.setItem(PORTS_KEY, JSON.stringify(knownPorts));
+      localStorage.setItem(PORTS_KEY, JSON.stringify({ all: knownPorts, recent: recentPorts }));
 
       applyTheme(obj.data.theme || "day");
 
@@ -723,6 +1051,23 @@ function scheduleAutoTideSync() {
 planFrom.addEventListener("input", scheduleAutoTideSync);
 planTo.addEventListener("input", scheduleAutoTideSync);
 
+
+let sunSyncTimer = null;
+function scheduleAutoSunSync(){
+  clearTimeout(sunSyncTimer);
+  sunSyncTimer = setTimeout(() => {
+    const p = getCurrentPassage();
+    if (!p) return;
+    p.plan.date = planDate.value;
+    p.plan.from = planFrom.value.trim();
+    p.plan.to   = planTo.value.trim();
+    autoComputeSunriseSetForCurrent();
+  }, 180);
+}
+planDate.addEventListener("input", scheduleAutoSunSync);
+planFrom.addEventListener("input", scheduleAutoSunSync);
+planTo.addEventListener("input", scheduleAutoSunSync);
+
 // Save plan -> remember ports, ensure tide stations, then jump to Log
 planForm.addEventListener("submit", (e) => {
   e.preventDefault();
@@ -876,7 +1221,7 @@ function addLogEntry() {
   refreshHomePassageList();
 }
 
-function addSpecialEntry(noteText) {
+function addSpecialEntry(noteText, notesOverride = null) {
   const p = getCurrentPassage();
   if (!p) return alert("No passage selected.");
   ensureFlags(p);
@@ -898,7 +1243,7 @@ function addSpecialEntry(noteText) {
     waterLog: previous ? (previous.waterLog || "") : "",
     groundLog: previous ? previous.groundLog : "",
     fuelUsed: previous ? previous.fuelUsed : "",
-    notes: noteText || ""
+    notes: (notesOverride !== null ? notesOverride : (noteText || ""))
   };
 
   p.entries.unshift(entry);
@@ -953,10 +1298,32 @@ function deleteLogEntryById(entryId) {
   const idx = p.entries.findIndex(e => e.id === entryId);
   if (idx < 0) return;
 
+  const deleted = p.entries[idx];
+
   const ok = confirm("Delete this log entry?");
   if (!ok) return;
 
   p.entries.splice(idx, 1);
+
+  // If the Shutdown entry was deleted, clear the shutdown flag so a new one can be added (CL-070)
+  if (
+    deleted &&
+    typeof deleted.notes === "string" &&
+    deleted.notes.toLowerCase().startsWith("shutdown")
+  ) {
+    if (!p.finish) p.finish = {};
+    p.finish.shutdownLogged = false;
+    // Clear finish fields that are only meaningful after shutdown
+    p.finish.finishedAt = null;
+    p.finish.engineHoursEnd = null;
+    p.finish.fuelEndPercent = null;
+  }
+
+  // Keep shutdown flag consistent even if something odd happens
+  if (p.finish) {
+    const hasShutdown = (p.entries || []).some(e => typeof e.notes === "string" && e.notes.toLowerCase().startsWith("shutdown"));
+    p.finish.shutdownLogged = !!hasShutdown;
+  }
   savePassages();
   renderLogEntries();
   refreshHomePassageList();
@@ -1017,7 +1384,11 @@ engineStartBtn.addEventListener("click", () => {
       p.plan.engineHoursStart = eh;
       p.plan.fuelStartPercent = fu;
 
-      addSpecialEntry("Engine start");
+      const startBits = [];
+      if (eh) startBits.push(`EH ${eh}`);
+      if (fu) startBits.push(`Fuel ${fu}%`);
+      const startNotes = startBits.length ? `Engine start — ${startBits.join(" | ")}` : "Engine start";
+      addSpecialEntry("Engine start", startNotes);
       p.flags.engineStart = true;
 
       savePassages();
@@ -1079,8 +1450,14 @@ shutdownBtn.addEventListener("click", () => {
       p.finish.notes = document.getElementById("shNotes").value.trim();
       p.finish.shutdownLogged = true;
 
-      // Final entry note kept clean
-      const note = p.finish.notes ? `Shutdown / alongside – ${p.finish.notes}` : "Shutdown / alongside";
+      // Include key figures in the notes for quick scanability (CL-066)
+      const ehEnd = p.finish.engineHoursEnd;
+      const fuelEnd = p.finish.fuelEndPercent;
+      const shutBits = [];
+      if (ehEnd) shutBits.push(`EH ${ehEnd}`);
+      if (fuelEnd) shutBits.push(`Fuel ${fuelEnd}%`);
+      const shutPrefix = shutBits.length ? `Shutdown / alongside — ${shutBits.join(" | ")}` : "Shutdown / alongside";
+      const note = p.finish.notes ? `${shutPrefix} — ${p.finish.notes}` : shutPrefix;
 
       p.entries.unshift({
         id: "e_" + Date.now(),
@@ -1380,7 +1757,9 @@ homeNewPassageBtn.addEventListener("click", () => {
 
 loadPassages();
 loadPorts();
-renderPortsDatalist();
+setupPortAutocomplete();
+setupPortsManagerModal();
+refreshPortUI();
 applyTheme(localStorage.getItem(THEME_KEY) || "day");
 
 refreshHomePassageList();

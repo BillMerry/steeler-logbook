@@ -15,6 +15,9 @@ body{
   font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;
   font-size:16px;line-height:1.35;
   background:var(--bg);color:var(--fg);
+  display:flex;
+  flex-direction:column;
+  overflow:hidden; /* keep header fixed; tabs scroll inside main */
 }
 
 body[data-theme="night"]{
@@ -77,9 +80,29 @@ body[data-theme="night"]{
   box-shadow:0 0 0 1px var(--accent) inset;
 }
 
-main{padding:0.75rem 0.75rem 3.2rem}
-.tab{display:none}
-.tab.active{display:block}
+main{
+  flex:1 1 auto;
+  min-height:0;
+  overflow:hidden;
+  padding:0;
+}
+
+.tab{display:none;height:100%;min-height:0}
+
+/* Default: active tab scrolls under fixed header */
+.tab.active{
+  display:flex;
+  flex-direction:column;
+  height:100%;
+  min-height:0;
+  overflow:auto;
+  padding:0.75rem 0.75rem 3.2rem;
+}
+
+/* Log tab: panes handle scrolling; keep log header visible */
+#logTab.tab.active{
+  overflow:hidden;
+}
 
 /* Buttons */
 .btn{
@@ -234,7 +257,12 @@ body[data-theme="night"] .daily-summary-row{border-color:#333}
   margin-bottom:0.4rem;
 }
 
-.log-layout{display:flex;gap:0.4rem;min-height:50vh}
+.log-layout{
+  flex:1 1 auto;
+  min-height:0;
+  display:flex;
+  gap:0.4rem;
+}
 .log-layout.split .plan-summary{flex:0 0 45%;max-width:45%}
 .log-layout.split .log-table-wrapper{flex:1 1 0}
 .log-layout.plan-only .plan-summary{display:block;flex:1 1 100%}
@@ -249,6 +277,7 @@ body[data-theme="night"] .daily-summary-row{border-color:#333}
   font-size:0.8rem;
   overflow:auto;
   background:var(--panel);
+  min-height:0;
 }
 
 /* Plan summary */
@@ -361,3 +390,144 @@ body[data-theme="night"] .log-table input.log-input{border-bottom-color:#555}
 }
 .modal-title{font-weight:700;margin-bottom:0.5rem}
 .modal-actions{display:flex;justify-content:flex-end;gap:0.5rem;margin-top:0.75rem}
+
+
+/* --- Port autocomplete -------------------------------------------------- */
+label { position: relative; }
+
+.port-suggest {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% - 2px);
+  background: var(--panel-bg, #fff);
+  border: 1px solid rgba(0,0,0,0.15);
+  border-radius: 10px;
+  padding: 6px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  z-index: 50;
+}
+
+.port-suggest.hidden { display: none; }
+
+.port-suggest-item {
+  appearance: none;
+  border: 1px solid rgba(0,0,0,0.18);
+  background: #fff;
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+body.night .port-suggest {
+  background: #111;
+  border-color: rgba(255,255,255,0.18);
+}
+body.night .port-suggest-item {
+  background: #1b1b1b;
+  border-color: rgba(255,255,255,0.18);
+  color: #fff;
+}
+
+.ports-tools { margin: 6px 0 14px; }
+.btn-secondary {
+  border: 1px solid rgba(0,0,0,0.18);
+  background: #fff;
+  border-radius: 999px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+/* --- Modal -------------------------------------------------------------- */
+.modal.hidden { display: none; }
+.modal { position: fixed; inset: 0; z-index: 200; }
+.modal-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.35); }
+.modal-panel {
+  position: relative;
+  width: min(720px, calc(100% - 24px));
+  margin: 60px auto;
+  background: #fff;
+  border-radius: 16px;
+  box-shadow: 0 18px 60px rgba(0,0,0,0.25);
+  overflow: hidden;
+}
+body.night .modal-panel { background: #111; color: #fff; }
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 16px;
+  border-bottom: 2px solid var(--trim, #b40016);
+}
+.modal-title { font-weight: 700; }
+.modal-close {
+  appearance: none;
+  border: none;
+  background: transparent;
+  font-size: 22px;
+  cursor: pointer;
+  line-height: 1;
+}
+.modal-body { padding: 14px 16px; }
+.modal-help { opacity: 0.8; margin-bottom: 12px; }
+
+.ports-list { display: grid; gap: 8px; }
+.ports-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid rgba(0,0,0,0.14);
+  border-radius: 12px;
+}
+body.night .ports-row { border-color: rgba(255,255,255,0.18); }
+.ports-delete {
+  border: 1px solid rgba(0,0,0,0.18);
+  background: transparent;
+  border-radius: 999px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+body.night .ports-delete { border-color: rgba(255,255,255,0.18); color: #fff; }
+.ports-empty { opacity: 0.8; padding: 10px 0; }
+
+
+/* Settings */
+.settings-section{max-width:980px}
+.settings-card{
+  border:1px solid var(--border);
+  border-radius:0.6rem;
+  padding:0.6rem 0.7rem;
+  background:var(--panel);
+  border-left:3px solid var(--accent);
+  margin-bottom:0.6rem;
+}
+.settings-card h3{margin:0 0 0.35rem;font-size:0.95rem}
+.settings-row{display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.25rem}
+.home-hint{margin-top:0.5rem}
+
+/* Ports manager layout */
+.ports-row{display:flex;gap:0.6rem;align-items:flex-start;justify-content:space-between;padding:0.45rem 0;border-bottom:1px solid var(--border)}
+.ports-left{min-width:0;flex:1 1 auto}
+.ports-right{flex:0 0 auto}
+.ports-name{font-weight:700;margin-bottom:0.25rem}
+.ports-coords{display:flex;gap:0.35rem;flex-wrap:wrap;align-items:center}
+.ports-coord-input{max-width:10ch;padding:0.25rem 0.35rem;border:1px solid var(--border);border-radius:0.35rem;background:var(--panel);color:var(--fg)}
+.ports-mini{border-radius:999px;padding:0.25rem 0.55rem;border:1px solid #d0d0d0;background:var(--soft);color:var(--fg);font-size:0.78rem;cursor:pointer}
+
+
+/* --- Ports modal layering fix --- */
+#portsModalOverlay.modal-overlay{
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.25);
+  z-index: 10000;
+}
+#portsModal.modal-panel{
+  position: fixed;
+  z-index: 10001;
+}
