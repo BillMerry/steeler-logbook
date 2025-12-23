@@ -191,13 +191,12 @@ function renderPortsManagerList() {
     saveBtn.className = "ports-mini";
     saveBtn.textContent = "Save coords";
     saveBtn.addEventListener("click", () => {
-      const lat = parseFloat(latInput.value);
-      const lon = parseFloat(lonInput.value);
-      if (isNaN(lat) || isNaN(lon)) {
+      const parsed = parseLatLon(latInput.value, lonInput.value);
+      if (!parsed) {
         alert("Please enter valid decimal lat and lon (e.g. 50.757, -1.545).");
         return;
       }
-      upsertPortItem(name, lat, lon);
+      upsertPortItem(name, parsed.lat, parsed.lon);
       savePorts();
       renderPortsManagerList();
       autoComputeSunriseSetForCurrent();
@@ -209,8 +208,9 @@ function renderPortsManagerList() {
     lookupBtn.textContent = "Lookup";
     lookupBtn.addEventListener("click", async () => {
       try {
-        const q = encodeURIComponent(name + " port");
-        const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${q}`;
+        const q = encodeURIComponent(name + " harbour");
+        const viewbox = "-6.5,52.5,2.5,49.0";
+        const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&viewbox=${viewbox}&bounded=1&q=${q}`;
         const res = await fetch(url, { headers: { "Accept": "application/json" } });
         if (!res.ok) throw new Error("Lookup failed");
         const data = await res.json();
@@ -224,6 +224,10 @@ function renderPortsManagerList() {
           alert("Lookup returned invalid coordinates.");
           return;
         }
+        if(!saneForSteeler(lat, lon)){
+          alert("Lookup result looks too far away for a UK/Channel port. Please try manual entry or adjust the port name.");
+          return;
+        }
         latInput.value = lat.toFixed(6);
         lonInput.value = lon.toFixed(6);
       } catch (e) {
@@ -234,6 +238,14 @@ function renderPortsManagerList() {
 
     coords.appendChild(latInput);
     coords.appendChild(lonInput);
+
+    const dmm = document.createElement("div");
+    dmm.className = "ports-dmm";
+    const latV = (item && typeof item === "object" && item.lat != null) ? item.lat : NaN;
+    const lonV = (item && typeof item === "object" && item.lon != null) ? item.lon : NaN;
+    dmm.textContent = (isNaN(latV)||isNaN(lonV)) ? "" : formatDMM(latV, lonV);
+    coords.appendChild(dmm);
+
     coords.appendChild(saveBtn);
     coords.appendChild(lookupBtn);
 
@@ -351,6 +363,66 @@ function rememberPort(name) {
 }
 
 // --- Small helpers -------------------------------------------------
+
+// --- Coordinate formatting/parsing + sanity checks (CL-073) --------
+function formatDMM(lat, lon){
+  function one(val, isLat){
+    const hemi = isLat ? (val>=0 ? "N" : "S") : (val>=0 ? "E" : "W");
+    const a = Math.abs(val);
+    const deg = Math.floor(a);
+    const min = (a - deg) * 60;
+    // 3 decimals on minutes
+    return `${deg}°${min.toFixed(3)}'${hemi}`;
+  }
+  if (isNaN(lat) || isNaN(lon)) return "";
+  return one(lat,true) + "  " + one(lon,false);
+}
+
+function parseCoordPart(s, isLat){
+  if (!s) return NaN;
+  const t = String(s).trim().toUpperCase();
+  // decimal
+  if (/^-?\d+(\.\d+)?$/.test(t)) return parseFloat(t);
+
+  // DMM forms like 50°45.123'N or 50 45.123 N
+  const m = t.match(/^(\d{1,3})\s*(?:°|\s)\s*(\d{1,2}(?:\.\d+)?)\s*(?:'|\s)?\s*([NSEW])$/);
+  if (!m) return NaN;
+  const deg = parseInt(m[1],10);
+  const mins = parseFloat(m[2]);
+  const hemi = m[3];
+  let val = deg + (mins/60);
+  if (hemi === "S" || hemi === "W") val *= -1;
+  // basic range sanity
+  if (isLat && (val < -90 || val > 90)) return NaN;
+  if (!isLat && (val < -180 || val > 180)) return NaN;
+  return val;
+}
+
+function parseLatLon(latStr, lonStr){
+  const lat = parseCoordPart(latStr,true);
+  const lon = parseCoordPart(lonStr,false);
+  if (!isNaN(lat) && !isNaN(lon)) return {lat, lon};
+  return null;
+}
+
+// Haversine distance in km
+function distanceKm(lat1, lon1, lat2, lon2){
+  const R = 6371;
+  const rad = Math.PI/180;
+  const dLat = (lat2-lat1)*rad;
+  const dLon = (lon2-lon1)*rad;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*rad)*Math.cos(lat2*rad)*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(a));
+}
+
+// UK-centric sanity check for STEELER usage: reject lookups > 1500km from Solent-ish default.
+function saneForSteeler(lat, lon){
+  const refLat = 50.76;   // Lymington-ish
+  const refLon = -1.54;
+  const km = distanceKm(refLat, refLon, lat, lon);
+  return km <= 1500; // generous: covers UK + near continent
+}
+
 
 function getCurrentPassage() {
   return passages.find(p => p.id === currentPassageId) || null;
@@ -521,34 +593,83 @@ function updatePassageHeader() {
 }
 
 
-function autoComputeSunriseSetForCurrent(){
+
+async function ensurePortCoords(name){
+  const n = (name || "").trim();
+  if(!n) return null;
+
+  // already stored?
+  const existing = getPortCoords(n);
+  if (existing) return existing;
+
+  // try online lookup (if available)
+  try{
+    if (!navigator.onLine) return null;
+
+    // Add a lightweight bias towards UK/Channel area using viewbox
+    const q = encodeURIComponent(n + " harbour");
+    const viewbox = "-6.5,52.5,2.5,49.0"; // approx UK south & Channel
+    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&viewbox=${viewbox}&bounded=1&q=${q}`;
+    const res = await fetch(url, { headers: { "Accept":"application/json" } });
+    if(!res.ok) return null;
+    const data = await res.json();
+    if(!data || !data[0]) return null;
+
+    const lat = parseFloat(data[0].lat);
+    const lon = parseFloat(data[0].lon);
+    if(isNaN(lat) || isNaN(lon)) return null;
+
+    // sanity check (prevents Chichester, TX etc)
+    if(!saneForSteeler(lat, lon)){
+      console.warn("Lookup failed sanity check for", n, lat, lon, data[0]);
+      return null;
+    }
+
+    upsertPortItem(n, lat, lon);
+    savePorts();
+    return {name:n, lat, lon};
+  }catch(e){
+    console.warn("Port lookup failed:", e);
+    return null;
+  }
+}
+
+
+
+async function autoComputeSunriseSetForCurrent(){
   const p = getCurrentPassage();
   if (!p) return;
+
   const date = (p.plan.date || planDate?.value || "").trim();
   const from = (p.plan.from || planFrom?.value || "").trim();
   const to   = (p.plan.to   || planTo?.value || "").trim();
 
-  const origin = getPortCoords(from);
-  const dest = isLocalDestination(to) ? origin : getPortCoords(to);
+  if (!date || !from) return;
 
-  if (!date || !origin) return;
+  const origin = await ensurePortCoords(from);
+  const dest = isLocalDestination(to) ? origin : (to ? await ensurePortCoords(to) : null);
 
-  const sunRiseSet = calcSunTimes(date, origin.lat, origin.lon);
-  if (!sunRiseSet) return;
+  if (!origin) return;
 
-  let sunset = sunRiseSet.sunset;
+  const sunOrigin = calcSunTimes(date, origin.lat, origin.lon);
+  if (!sunOrigin) return;
+
+  let sunset = sunOrigin.sunset;
   if (dest && dest !== origin){
-    const destSun = calcSunTimes(date, dest.lat, dest.lon);
-    if (destSun && destSun.sunset) sunset = destSun.sunset;
+    const sunDest = calcSunTimes(date, dest.lat, dest.lon);
+    if (sunDest && sunDest.sunset) sunset = sunDest.sunset;
   }
 
-  const val = `${sunRiseSet.sunrise} / ${sunset}`;
+  const val = `${sunOrigin.sunrise} / ${sunset}`;
   p.plan.sunriseSet = val;
+
   if (planSunriseSet) planSunriseSet.value = val;
+
   savePassages();
   updatePassageHeader();
   updatePlanSummaryPanel();
 }
+
 
 // --- Ports datalist -----------------------------------------------
 

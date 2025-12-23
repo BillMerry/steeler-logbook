@@ -531,3 +531,5 @@ body.night .ports-delete { border-color: rgba(255,255,255,0.18); color: #fff; }
   position: fixed;
   z-index: 10001;
 }
+
+.ports-dmm{flex-basis:100%;font-size:0.78rem;opacity:0.85;margin-top:0.15rem}
