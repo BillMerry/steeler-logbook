@@ -533,3 +533,7 @@ body.night .ports-delete { border-color: rgba(255,255,255,0.18); color: #fff; }
 }
 
 .ports-dmm{flex-basis:100%;font-size:0.78rem;opacity:0.85;margin-top:0.15rem}
+
+/* Manage Ports modal scrolling */
+#portsManagerList{max-height:60vh;overflow:auto;-webkit-overflow-scrolling:touch}
+.modal .modal-content{max-height:80vh;overflow:auto;-webkit-overflow-scrolling:touch}

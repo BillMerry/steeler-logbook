@@ -1,11 +1,14 @@
-const CACHE_NAME = "steeler-logbook-v4";
+const CACHE_NAME = "steeler-logbook-v4-11";
 
 const ASSETS = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
-  "./manifest.json"
+  "./manifest.json",
+  "./favicon.ico",
+  "./icons/steeler-192.png",
+  "./icons/steeler-512.png"
 ];
 
 self.addEventListener("install", (event) => {

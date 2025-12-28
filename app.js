@@ -350,7 +350,7 @@ function rememberPort(name) {
   // Add to master list
   if (!knownPorts.includes(trimmed)) {
     knownPorts.push(trimmed);
-    knownPorts.sort((a, b) => a.localeCompare(b));
+    knownPorts.sort((a,b)=>String(a?.name ?? a ?? "").localeCompare(String(b?.name ?? b ?? ""), undefined, {sensitivity:"base"}));
   }
 
   // Update MRU list (most recent first)
@@ -423,6 +423,168 @@ function saneForSteeler(lat, lon){
   return km <= 1500; // generous: covers UK + near continent
 }
 
+// --- Port coordinate helpers (offline-first) -----------------------------
+
+function normalisePortQuery(name){
+  return (name || "")
+    .toString()
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[,]/g, "")
+    .replace(/\b(harbour|harbor|marina|port)\b/ig, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function getPortCoords(name){
+  const q = normalisePortQuery(name);
+  if (!q) return null;
+
+  // 1) exact match against stored knownPorts (objects only)
+  for (const p of (knownPorts || [])){
+    if (p && typeof p === "object" && p.lat != null && p.lon != null){
+      const pn = normalisePortQuery(p.name || "");
+      if (pn && pn === q){
+        return { name: p.name || name, lat: Number(p.lat), lon: Number(p.lon) };
+      }
+    }
+  }
+
+  // 2) offline baked-in UK/Channel micro-database (marine-sane only)
+  const OFFLINE_PORTS = {
+    "lymington": {lat:50.758, lon:-1.540},
+    "cowes": {lat:50.763, lon:-1.297},
+    "yarmouth": {lat:50.705, lon:-1.498},
+    "portsmouth": {lat:50.802, lon:-1.109},
+    "gosport": {lat:50.795, lon:-1.125},
+    "port solent": {lat:50.845, lon:-1.138},
+    "poole": {lat:50.714, lon:-1.985},
+    "weymouth": {lat:50.613, lon:-2.455},
+    "dartmouth": {lat:50.351, lon:-3.579},
+    "salcombe": {lat:50.237, lon:-3.769},
+    "plymouth": {lat:50.366, lon:-4.143},
+    "falmouth": {lat:50.155, lon:-5.073},
+    "fowey": {lat:50.336, lon:-4.638},
+    "padstow": {lat:50.544, lon:-4.936},
+    "st vaast": {lat:49.590, lon:-1.267},
+    "cherbourg": {lat:49.642, lon:-1.622},
+    "st helier": {lat:49.183, lon:-2.105},
+    "st malo": {lat:48.649, lon:-2.025},
+    "dunkerque": {lat:51.049, lon:2.377},
+    "calais": {lat:50.958, lon:1.851},
+    "dieppe": {lat:49.922, lon:1.077},
+    "le havre": {lat:49.491, lon:0.107},
+    "honfleur": {lat:49.419, lon:0.233},
+    "deauville": {lat:49.363, lon:0.078},
+    "brighton": {lat:50.820, lon:-0.142},
+    "newhaven": {lat:50.793, lon:0.055},
+    "eastbourne": {lat:50.770, lon:0.293},
+    "chichester": {lat:50.814, lon:-0.876},
+    "langstone": {lat:50.824, lon:-1.012}
+  };
+
+  if (OFFLINE_PORTS[q]) return { name, lat: OFFLINE_PORTS[q].lat, lon: OFFLINE_PORTS[q].lon };
+
+  // 3) fuzzy: allow prefix match for e.g. "Chichester Harbour"
+  const keys = Object.keys(OFFLINE_PORTS);
+  const hit = keys.find(k => q === k || q.startsWith(k + " ") || k.startsWith(q + " "));
+  if (hit) return { name, lat: OFFLINE_PORTS[hit].lat, lon: OFFLINE_PORTS[hit].lon };
+
+  return null;
+}
+
+// --- Sunrise / sunset calculation (NOAA approximation, offline) ----------
+
+function parseISODate(iso){
+  // expects YYYY-MM-DD from <input type="date">
+  const m = /^\s*(\d{4})-(\d{2})-(\d{2})\s*$/.exec(iso || "");
+  if (!m) return null;
+  const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+  if (!y || !mo || !d) return null;
+  return { y, mo, d };
+}
+
+function dayOfYear(y, mo, d){
+  const dt = new Date(Date.UTC(y, mo-1, d));
+  const start = new Date(Date.UTC(y, 0, 1));
+  return Math.floor((dt - start) / 86400000) + 1;
+}
+
+function degToRad(x){ return x * Math.PI / 180; }
+function radToDeg(x){ return x * 180 / Math.PI; }
+
+function calcSunTimeUtcMinutes(isRise, y, mo, d, lat, lon){
+  // Based on NOAA solar calculations (approx). Returns minutes after 00:00 UTC.
+  const N = dayOfYear(y, mo, d);
+  const lngHour = lon / 15;
+
+  const t = N + ((isRise ? 6 : 18) - lngHour) / 24;
+
+  const M = (0.9856 * t) - 3.289;
+
+  let L = M + (1.916 * Math.sin(degToRad(M))) + (0.020 * Math.sin(degToRad(2*M))) + 282.634;
+  L = (L % 360 + 360) % 360;
+
+  let RA = radToDeg(Math.atan(0.91764 * Math.tan(degToRad(L))));
+  RA = (RA % 360 + 360) % 360;
+
+  // Quadrant adjustment
+  const Lquadrant  = Math.floor(L / 90) * 90;
+  const RAquadrant = Math.floor(RA / 90) * 90;
+  RA = RA + (Lquadrant - RAquadrant);
+  RA = RA / 15;
+
+  const sinDec = 0.39782 * Math.sin(degToRad(L));
+  const cosDec = Math.cos(Math.asin(sinDec));
+
+  // Official zenith for sunrise/sunset
+  const zenith = 90.833;
+
+  const cosH = (Math.cos(degToRad(zenith)) - (sinDec * Math.sin(degToRad(lat)))) / (cosDec * Math.cos(degToRad(lat)));
+  if (cosH > 1 || cosH < -1) return null; // polar day/night edge cases
+
+  let H = isRise ? (360 - radToDeg(Math.acos(cosH))) : radToDeg(Math.acos(cosH));
+  H = H / 15;
+
+  const T = H + RA - (0.06571 * t) - 6.622;
+  let UT = T - lngHour;
+  UT = (UT % 24 + 24) % 24;
+
+  return Math.round(UT * 60);
+}
+
+function formatTimeEuropeLondon(dateUtc){
+  try{
+    return new Intl.DateTimeFormat("en-GB", {
+      hour: "2-digit", minute: "2-digit",
+      hour12: false,
+      timeZone: "Europe/London"
+    }).format(dateUtc);
+  }catch{
+    // fallback: local
+    return dateUtc.toLocaleTimeString("en-GB", {hour:"2-digit", minute:"2-digit", hour12:false});
+  }
+}
+
+function calcSunTimes(isoDate, lat, lon){
+  const p = parseISODate(isoDate);
+  if (!p) return null;
+  const riseMin = calcSunTimeUtcMinutes(true, p.y, p.mo, p.d, lat, lon);
+  const setMin  = calcSunTimeUtcMinutes(false, p.y, p.mo, p.d, lat, lon);
+  if (riseMin == null || setMin == null) return null;
+
+  const riseUtc = new Date(Date.UTC(p.y, p.mo-1, p.d, 0, 0, 0) + riseMin*60000);
+  const setUtc  = new Date(Date.UTC(p.y, p.mo-1, p.d, 0, 0, 0) + setMin*60000);
+
+  return {
+    sunrise: formatTimeEuropeLondon(riseUtc),
+    sunset:  formatTimeEuropeLondon(setUtc)
+  };
+}
+
+
+
 
 function getCurrentPassage() {
   return passages.find(p => p.id === currentPassageId) || null;
@@ -450,6 +612,8 @@ function timeOnlyFromIso(iso) {
 }
 
 function switchToTab(tabId) {
+  closePortsManagerModal();
+
   tabButtons.forEach(b => b.classList.toggle("active", b.dataset.tab === tabId));
   tabs.forEach(t => t.classList.toggle("active", t.id === tabId));
 }
@@ -1897,4 +2061,9 @@ if ("serviceWorker" in navigator) {
       console.warn("Service worker registration failed", err);
     });
   });
+}
+
+function closePortsManagerModal(){
+  const modal = document.getElementById("portsModal");
+  if (modal) modal.classList.add("hidden");
 }
