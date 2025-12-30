@@ -117,7 +117,11 @@
         <textarea id="planCurrents" rows="3" placeholder="Notes on tidal streams, overfalls, gates, etc."></textarea>
 
         <h3>Weather (Inshore Waters)</h3>
-        <textarea id="planWeather" rows="4" placeholder="Met Office Inshore Waters forecast summary..."></textarea>
+        <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;margin-bottom:0.35rem">
+          <button id="btnFetchWeather" class="btn btn-secondary btn-small" type="button">Fetch Met Office</button>
+          <div id="weatherFetchStatus" class="hint"></div>
+        </div>
+        <textarea id="planWeather" rows="6" placeholder="Met Office Inshore Waters forecast summary..."></textarea>
 
         <h3>Comms / Pilotage Notes</h3>
         <textarea id="planComms" rows="4" placeholder="VHF channels, phone numbers, pilotage notes..."></textarea>
@@ -222,7 +226,7 @@
   </div>
 
   <footer class="app-footer">
-    <small>Data stored locally on this device · STEELER Logbook v0.4.11</small>
+    <small>Data stored locally on this device · STEELER Logbook v0.4.15</small>
   </footer>
 
 

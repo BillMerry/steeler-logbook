@@ -1,4 +1,4 @@
-const CACHE_NAME = "steeler-logbook-v4-11";
+const CACHE_NAME = "steeler-logbook-v4-16";
 
 const ASSETS = [
   "./",

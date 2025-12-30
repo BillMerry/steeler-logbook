@@ -54,10 +54,12 @@ function getPortSuggestions(query) {
     list = knownPorts.filter(p => portName(p).toLowerCase().includes(q));
     // prefer starts-with matches
     list.sort((a, b) => {
-      const aStart = a.toLowerCase().startsWith(q) ? 0 : 1;
-      const bStart = b.toLowerCase().startsWith(q) ? 0 : 1;
+      const an = portName(a).toLowerCase();
+      const bn = portName(b).toLowerCase();
+      const aStart = an.startsWith(q) ? 0 : 1;
+      const bStart = bn.startsWith(q) ? 0 : 1;
       if (aStart !== bStart) return aStart - bStart;
-      return a.localeCompare(b);
+      return an.localeCompare(bn);
     });
   }
 
@@ -128,6 +130,24 @@ function setupSinglePortAutocomplete(inputId, boxId) {
 function setupPortAutocomplete() {
   setupSinglePortAutocomplete("planFrom", "planFromSuggest");
   setupSinglePortAutocomplete("planTo", "planToSuggest");
+}
+
+function setupPortCoordConfirmation(){
+  // When a user finishes typing a new port name, try to look up coords and ask whether to save.
+  const hook = (el) => {
+    if (!el) return;
+    el.addEventListener("blur", async () => {
+      const name = (el.value || "").trim();
+      if (!isLikelyRealPortName(name)) return;
+      // If we already have coords, just update MRU.
+      const existing = findPortItemByName(name);
+      if (existing && portHasCoords(existing)) { rememberPort(name); return; }
+      // Otherwise run the new-port flow (lookup + user confirmation).
+      await maybeSaveNewPort(name);
+    });
+  };
+  hook(document.getElementById("planFrom"));
+  hook(document.getElementById("planTo"));
 }
 
 function deletePort(name) {
@@ -208,24 +228,24 @@ function renderPortsManagerList() {
     lookupBtn.textContent = "Lookup";
     lookupBtn.addEventListener("click", async () => {
       try {
-        const q = encodeURIComponent(name + " harbour");
-        const viewbox = "-6.5,52.5,2.5,49.0";
-        const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&viewbox=${viewbox}&bounded=1&q=${q}`;
-        const res = await fetch(url, { headers: { "Accept": "application/json" } });
+        const q = encodeURIComponent(normalisePortQuery(name) + " harbour");
+        const viewbox = "-6.8,53.5,3.5,45.5"; // UK + Channel + N France (down to La Rochelle)
+        const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=3&countrycodes=gb,fr&viewbox=${viewbox}&bounded=1&q=${q}`;
+        const res = await fetch(url, { headers: { "Accept": "application/json", "Accept-Language":"en" } });
         if (!res.ok) throw new Error("Lookup failed");
         const data = await res.json();
-        if (!data || !data[0]) {
+        if (!data || !data.length) {
           alert("No match found. Try manual lat/lon.");
           return;
         }
-        const lat = parseFloat(data[0].lat);
-        const lon = parseFloat(data[0].lon);
+        let lat = NaN, lon = NaN;
+        for (const it of data){
+          const la = parseFloat(it.lat);
+          const lo = parseFloat(it.lon);
+          if (!isNaN(la) && !isNaN(lo) && saneForSteeler(la, lo)) { lat = la; lon = lo; break; }
+        }
         if (isNaN(lat) || isNaN(lon)) {
           alert("Lookup returned invalid coordinates.");
-          return;
-        }
-        if(!saneForSteeler(lat, lon)){
-          alert("Lookup result looks too far away for a UK/Channel port. Please try manual entry or adjust the port name.");
           return;
         }
         latInput.value = lat.toFixed(6);
@@ -332,6 +352,9 @@ function loadPorts() {
     knownPorts = [];
     recentPorts = [];
   }
+
+  // defensive cleanup (prevents single-letter junk entries)
+  try{ cleanPortsInPlace(); }catch{}
 }
 
 function savePorts() {
@@ -343,21 +366,49 @@ function savePorts() {
   }
 }
 
+function isLikelyRealPortName(name){
+  const n = (name || "").toString().trim();
+  if (!n) return false;
+  // Avoid accidental fragments created while typing (e.g. "C", "Ca", "Car")
+  if (n.length < 2) return false;
+  if (/^[A-Za-z]$/.test(n)) return false;
+
+  // Must contain at least 2 letters somewhere
+  const letters = (n.match(/[A-Za-zÀ-ÿ]/g) || []).length;
+  if (letters < 2) return false;
+
+  // Require a "proper" looking name:
+  // - 4+ chars, OR
+  // - contains a separator (space/hyphen/apostrophe), OR
+  // - common short prefix like "St" (for St Malo, St Vaast, etc.)
+  const hasSep = /[\s\-’'\.]/.test(n);
+  const isSt = /^st\b/i.test(n);
+  if (n.length < 4 && !hasSep && !isSt) return false;
+
+  return true;
+}
+
+function cleanPortsInPlace(){
+  // Drop junk like single letters that can get saved by mistake.
+  knownPorts = (knownPorts || []).filter(p => isLikelyRealPortName(portName(p)));
+  recentPorts = (recentPorts || []).filter(p => isLikelyRealPortName(p));
+}
+
 function rememberPort(name) {
   const trimmed = (name || "").trim();
-  if (!trimmed) return;
+  if (!isLikelyRealPortName(trimmed)) return;
 
-  // Add to master list
-  if (!knownPorts.includes(trimmed)) {
-    knownPorts.push(trimmed);
-    knownPorts.sort((a,b)=>String(a?.name ?? a ?? "").localeCompare(String(b?.name ?? b ?? ""), undefined, {sensitivity:"base"}));
-  }
+  // Only add to MRU if the port already exists in the saved list.
+  // New ports must be created via the coordinate-confirmation flow.
+  const existing = findPortItemByName(trimmed);
+  if (!existing) return;
 
   // Update MRU list (most recent first)
   recentPorts = recentPorts.filter(p => p !== trimmed);
   recentPorts.unshift(trimmed);
   if (recentPorts.length > PORTS_RECENT_LIMIT) recentPorts.length = PORTS_RECENT_LIMIT;
 
+  cleanPortsInPlace();
   savePorts();
   refreshPortUI();
 }
@@ -471,11 +522,21 @@ function getPortCoords(name){
     "cherbourg": {lat:49.642, lon:-1.622},
     "st helier": {lat:49.183, lon:-2.105},
     "st malo": {lat:48.649, lon:-2.025},
+    // Northern / Western France (handy for Seine→La Rochelle season)
+    "le havre": {lat:49.494, lon:0.107},
+    "honfleur": {lat:49.419, lon:0.232},
+    "dieppe": {lat:49.925, lon:1.078},
+    "fecamp": {lat:49.757, lon:0.374},
+    "granville": {lat:48.839, lon:-1.596},
+    "roscoff": {lat:48.724, lon:-3.984},
+    "brest": {lat:48.390, lon:-4.487},
+    "concarneau": {lat:47.875, lon:-3.917},
+    "lorient": {lat:47.748, lon:-3.366},
+    "les sables d'olonne": {lat:46.496, lon:-1.794},
+    "la rochelle": {lat:46.155, lon:-1.151},
+    "la rochelle-pallice": {lat:46.159, lon:-1.223},
     "dunkerque": {lat:51.049, lon:2.377},
     "calais": {lat:50.958, lon:1.851},
-    "dieppe": {lat:49.922, lon:1.077},
-    "le havre": {lat:49.491, lon:0.107},
-    "honfleur": {lat:49.419, lon:0.233},
     "deauville": {lat:49.363, lon:0.078},
     "brighton": {lat:50.820, lon:-0.142},
     "newhaven": {lat:50.793, lon:0.055},
@@ -686,6 +747,8 @@ const planSunriseSet = document.getElementById("planSunriseSet");
 const planTidalCoeff = document.getElementById("planTidalCoeff");
 const planCurrents = document.getElementById("planCurrents");
 const planWeather = document.getElementById("planWeather");
+const btnFetchWeather = document.getElementById("btnFetchWeather");
+const weatherFetchStatus = document.getElementById("weatherFetchStatus");
 const planComms = document.getElementById("planComms");
 const tideStationsContainer = document.getElementById("tideStationsContainer");
 const addTideStationBtn = document.getElementById("addTideStationBtn");
@@ -758,7 +821,7 @@ function updatePassageHeader() {
 
 
 
-async function ensurePortCoords(name){
+async function ensurePortCoords(name, opts = {}){
   const n = (name || "").trim();
   if(!n) return null;
 
@@ -770,32 +833,285 @@ async function ensurePortCoords(name){
   try{
     if (!navigator.onLine) return null;
 
-    // Add a lightweight bias towards UK/Channel area using viewbox
-    const q = encodeURIComponent(n + " harbour");
-    const viewbox = "-6.5,52.5,2.5,49.0"; // approx UK south & Channel
-    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&viewbox=${viewbox}&bounded=1&q=${q}`;
-    const res = await fetch(url, { headers: { "Accept":"application/json" } });
+    // Bias toward UK / Channel / N France (down to La Rochelle)
+    const q = encodeURIComponent(normalisePortQuery(n) + " harbour");
+    const viewbox = "-6.8,53.5,3.5,45.5"; // left,top,right,bottom
+    const base = "https://nominatim.openstreetmap.org/search";
+    const url = `${base}?format=jsonv2&limit=3&countrycodes=gb,fr&viewbox=${viewbox}&bounded=1&q=${q}`;
+    const res = await fetch(url, {
+      headers: {
+        "Accept":"application/json",
+        "Accept-Language":"en"
+      }
+    });
     if(!res.ok) return null;
     const data = await res.json();
-    if(!data || !data[0]) return null;
+    if(!data || !data.length) return null;
 
-    const lat = parseFloat(data[0].lat);
-    const lon = parseFloat(data[0].lon);
+    // pick first sane result
+    let lat = NaN, lon = NaN;
+    for (const item of data){
+      const la = parseFloat(item.lat);
+      const lo = parseFloat(item.lon);
+      if (!isNaN(la) && !isNaN(lo) && saneForSteeler(la, lo)){
+        lat = la; lon = lo;
+        break;
+      }
+    }
     if(isNaN(lat) || isNaN(lon)) return null;
 
-    // sanity check (prevents Chichester, TX etc)
-    if(!saneForSteeler(lat, lon)){
-      console.warn("Lookup failed sanity check for", n, lat, lon, data[0]);
-      return null;
-    }
+    const shouldSave = (opts.save !== false);
+    const wantConfirm = !!opts.confirm;
 
-    upsertPortItem(n, lat, lon);
-    savePorts();
+    // If confirming, confirm whenever the port either doesn't exist yet OR exists only as a name (no coords).
+    const existingItem = findPortItemByName(n);
+    const existingHasCoords = portHasCoords(existingItem);
+    const needsConfirm = wantConfirm && (!existingItem || !existingHasCoords);
+
+    if (shouldSave){
+      if (needsConfirm){
+        const dmm = formatDMM(lat, lon);
+        const ok = confirm(`Save coordinates for "${n}"?\n\nLat/Lon: ${lat.toFixed(6)}, ${lon.toFixed(6)}\n${dmm}`);
+        if (ok){
+          upsertPortItem(n, lat, lon);
+          cleanPortsInPlace();
+          savePorts();
+        }
+      } else {
+        upsertPortItem(n, lat, lon);
+        cleanPortsInPlace();
+        savePorts();
+      }
+    }
     return {name:n, lat, lon};
   }catch(e){
     console.warn("Port lookup failed:", e);
     return null;
   }
+}
+
+// --- New-port flow: lookup + user confirmation before saving ---------
+
+function normalisePortDisplay(name){
+  return (name || "").toString().trim().replace(/\s+/g, " ");
+}
+
+async function lookupPortCoordsOnline(name){
+  const n = normalisePortDisplay(name);
+  if (!n || !navigator.onLine) return null;
+
+  const viewbox = "-6.8,53.5,3.5,45.5"; // UK + Channel + N France (down to La Rochelle)
+  const base = "https://nominatim.openstreetmap.org/search";
+
+  // Try a small set of increasingly relaxed marine-sane queries.
+  const q0 = normalisePortQuery(n);
+  const queries = [
+    `${q0} harbour`,
+    `${q0} port`,
+    `port de ${q0}`,
+    `${q0} marina`,
+    `${q0}, france`,
+    `${q0}, uk`
+  ].map(q => q.trim()).filter(Boolean);
+
+  for (const q of queries){
+    try{
+      const url = `${base}?format=jsonv2&limit=5&countrycodes=gb,fr&viewbox=${viewbox}&bounded=1&q=${encodeURIComponent(q)}`;
+      const res = await fetch(url, {
+        headers: { "Accept":"application/json", "Accept-Language":"en,fr" }
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (!data || !data.length) continue;
+
+      for (const item of data){
+        const la = parseFloat(item.lat);
+        const lo = parseFloat(item.lon);
+        if (!isNaN(la) && !isNaN(lo) && saneForSteeler(la, lo)){
+          return { lat: la, lon: lo, displayName: item.display_name || "" };
+        }
+      }
+    }catch(e){
+      // try next query
+    }
+  }
+
+  return null;
+}
+
+function showPortConfirmModal({ name, lat, lon, displayName }){
+  return new Promise((resolve) => {
+    const n = normalisePortDisplay(name);
+    const dmm = formatDMM(lat, lon);
+
+    const safeDisplay = escapeHtml(displayName || "");
+    const body = `
+      <p><strong>${escapeHtml(n)}</strong> isn’t in your saved ports yet.</p>
+      ${safeDisplay ? `<p class="muted" style="margin-top:6px">Match: ${safeDisplay}</p>` : ""}
+      <div style="margin-top:10px; padding:10px; border:1px solid var(--line); border-radius:12px;">
+        <div><strong>Lat/Lon</strong>: ${lat.toFixed(6)}, ${lon.toFixed(6)}</div>
+        <div style="margin-top:4px">${escapeHtml(dmm)}</div>
+      </div>
+      <p style="margin-top:10px" class="muted">Save this as a port for future lookups?</p>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px">
+        <button id="pcSave" class="btn">Save port</button>
+        <button id="pcManual" class="btn">Enter manually</button>
+        <button id="pcSkip" class="btn secondary">Not now</button>
+      </div>
+      <div id="pcManualWrap" class="hidden" style="margin-top:10px">
+        <div style="display:flex; gap:8px; flex-wrap:wrap">
+          <input id="pcLat" type="number" step="0.0001" inputmode="decimal" placeholder="Lat" style="flex:1; min-width:120px">
+          <input id="pcLon" type="number" step="0.0001" inputmode="decimal" placeholder="Lon" style="flex:1; min-width:120px">
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px">
+          <button id="pcManualSave" class="btn">Save coords</button>
+          <button id="pcManualCancel" class="btn secondary">Cancel</button>
+        </div>
+        <p class="muted" style="margin-top:6px">Tip: decimal degrees (e.g. 49.710, -1.880).</p>
+      </div>
+    `;
+
+    // Render into the existing modal chrome but hide default OK/Cancel.
+    showModal({
+      title: "Save port coordinates",
+      bodyHtml: body,
+      hideButtons: true,
+      onOk: null
+    });
+
+    const finish = (result) => {
+      // close + resolve
+      modalOverlay.classList.add("hidden");
+      modalBody.innerHTML = "";
+      if (modalOkBtn) modalOkBtn.style.display = "";
+      if (modalCancelBtn) modalCancelBtn.style.display = "";
+      resolve(result);
+    };
+
+    const btnSave = document.getElementById("pcSave");
+    const btnManual = document.getElementById("pcManual");
+    const btnSkip = document.getElementById("pcSkip");
+    const manualWrap = document.getElementById("pcManualWrap");
+    const manualSave = document.getElementById("pcManualSave");
+    const manualCancel = document.getElementById("pcManualCancel");
+
+    btnSave?.addEventListener("click", () => finish({ action: "save", lat, lon }));
+    btnSkip?.addEventListener("click", () => finish({ action: "skip" }));
+    btnManual?.addEventListener("click", () => {
+      manualWrap?.classList.remove("hidden");
+    });
+    manualCancel?.addEventListener("click", () => {
+      manualWrap?.classList.add("hidden");
+    });
+    manualSave?.addEventListener("click", () => {
+      const latIn = document.getElementById("pcLat")?.value;
+      const lonIn = document.getElementById("pcLon")?.value;
+      const parsed = parseLatLon(latIn, lonIn);
+      if (!parsed){
+        alert("Please enter valid decimal lat and lon.");
+        return;
+      }
+      if (!saneForSteeler(parsed.lat, parsed.lon)){
+        alert("Those coordinates look outside your normal UK/Channel/N France range.");
+        return;
+      }
+      finish({ action: "save", lat: parsed.lat, lon: parsed.lon });
+    });
+
+    // Clicking outside should behave like skip.
+    document.getElementById("modalOverlay")?.addEventListener("click", (e) => {
+      if (e.target === modalOverlay) finish({ action: "skip" });
+    }, { once: true });
+  });
+}
+
+function showPortNoMatchModal(name){
+  return new Promise((resolve) => {
+    const n = normalisePortDisplay(name);
+    const body = `
+      <p>Couldn’t find a marine-sane match for <strong>${escapeHtml(n)}</strong>.</p>
+      <p class="muted" style="margin-top:6px">You can enter coordinates manually, or skip for now (the passage can still be saved).</p>
+      <div style="margin-top:10px; padding:10px; border:1px solid var(--line); border-radius:12px;">
+        <div style="display:flex; gap:8px; flex-wrap:wrap">
+          <input id="pnmLat" type="number" step="0.0001" inputmode="decimal" placeholder="Lat" style="flex:1; min-width:120px">
+          <input id="pnmLon" type="number" step="0.0001" inputmode="decimal" placeholder="Lon" style="flex:1; min-width:120px">
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px">
+          <button id="pnmSave" class="btn">Save coords</button>
+          <button id="pnmSkip" class="btn secondary">Not now</button>
+        </div>
+        <p class="muted" style="margin-top:6px">Tip: decimal degrees (e.g. 49.710, -1.880).</p>
+      </div>
+    `;
+
+    showModal({ title: "Add port manually", bodyHtml: body, hideButtons: true, onOk: null });
+
+    const finish = (result) => {
+      modalOverlay.classList.add("hidden");
+      modalBody.innerHTML = "";
+      if (modalOkBtn) modalOkBtn.style.display = "";
+      if (modalCancelBtn) modalCancelBtn.style.display = "";
+      resolve(result);
+    };
+
+    document.getElementById("pnmSkip")?.addEventListener("click", () => finish({ action: "skip" }));
+    document.getElementById("pnmSave")?.addEventListener("click", () => {
+      const latIn = document.getElementById("pnmLat")?.value;
+      const lonIn = document.getElementById("pnmLon")?.value;
+      const parsed = parseLatLon(latIn, lonIn);
+      if (!parsed){
+        alert("Please enter valid decimal lat and lon.");
+        return;
+      }
+      if (!saneForSteeler(parsed.lat, parsed.lon)){
+        alert("Those coordinates look outside your normal UK/Channel/N France range.");
+        return;
+      }
+      finish({ action: "save", lat: parsed.lat, lon: parsed.lon });
+    });
+
+    document.getElementById("modalOverlay")?.addEventListener("click", (e) => {
+      if (e.target === modalOverlay) finish({ action: "skip" });
+    }, { once: true });
+  });
+}
+
+async function maybeSaveNewPort(name){
+  const n = normalisePortDisplay(name);
+  if (!isLikelyRealPortName(n)) return null;
+
+  const existing = findPortItemByName(n);
+  if (existing && portHasCoords(existing)) {
+    rememberPort(n);
+    return { name: n, lat: Number(existing.lat), lon: Number(existing.lon) };
+  }
+
+  // Lookup (online) to propose coordinates.
+  const hit = await lookupPortCoordsOnline(n);
+  if (!hit) {
+    const manual = await showPortNoMatchModal(n);
+    if (manual && manual.action === "save"){
+      upsertPortItem(n, manual.lat, manual.lon);
+      cleanPortsInPlace();
+      savePorts();
+      rememberPort(n);
+      refreshPortUI();
+      return { name: n, lat: manual.lat, lon: manual.lon };
+    }
+    return null;
+  }
+
+  const decision = await showPortConfirmModal({ name: n, lat: hit.lat, lon: hit.lon, displayName: hit.displayName });
+  if (decision && decision.action === "save"){
+    upsertPortItem(n, decision.lat, decision.lon);
+    cleanPortsInPlace();
+    savePorts();
+    rememberPort(n);
+    refreshPortUI();
+    return { name: n, lat: decision.lat, lon: decision.lon };
+  }
+
+  return null;
 }
 
 
@@ -808,10 +1124,14 @@ async function autoComputeSunriseSetForCurrent(){
   const from = (p.plan.from || planFrom?.value || "").trim();
   const to   = (p.plan.to   || planTo?.value || "").trim();
 
-  if (!date || !from) return;
+  // Don't try to look anything up while the user is still typing fragments.
+  if (!date || !isLikelyRealPortName(from)) return;
 
-  const origin = await ensurePortCoords(from);
-  const dest = isLocalDestination(to) ? origin : (to ? await ensurePortCoords(to) : null);
+  // For auto-fill we *do not* save ports/coords (prevents "Ca", "Car" etc being stored).
+  const origin = await ensurePortCoords(from, { save: false });
+  const dest = (isLikelyRealPortName(to)
+    ? (isLocalDestination(to) ? origin : await ensurePortCoords(to, { save: false }))
+    : null);
 
   if (!origin) return;
 
@@ -845,16 +1165,24 @@ function refreshPortUI() {
 
 // --- Modal ---------------------------------------------------------
 
-function showModal({ title, bodyHtml, onOk }) {
+function showModal({ title, bodyHtml, onOk, okText = "OK", cancelText = "Cancel", hideButtons = false }) {
   modalTitle.textContent = title;
   modalBody.innerHTML = bodyHtml;
   modalOverlay.classList.remove("hidden");
+
+  // Button text + visibility
+  if (modalOkBtn) modalOkBtn.textContent = okText;
+  if (modalCancelBtn) modalCancelBtn.textContent = cancelText;
+  if (modalOkBtn) modalOkBtn.style.display = hideButtons ? "none" : "";
+  if (modalCancelBtn) modalCancelBtn.style.display = hideButtons ? "none" : "";
 
   const cleanup = () => {
     modalOverlay.classList.add("hidden");
     modalBody.innerHTML = "";
     modalOkBtn.onclick = null;
     modalCancelBtn.onclick = null;
+    if (modalOkBtn) modalOkBtn.style.display = "";
+    if (modalCancelBtn) modalCancelBtn.style.display = "";
   };
 
   modalCancelBtn.onclick = () => cleanup();
@@ -1353,8 +1681,255 @@ planDate.addEventListener("input", scheduleAutoSunSync);
 planFrom.addEventListener("input", scheduleAutoSunSync);
 planTo.addEventListener("input", scheduleAutoSunSync);
 
+// --- CL-074: Fetch Met Office Inshore Waters forecast (with manual edit) ---
+const METOFFICE_INSHORE_URL = "https://weather.metoffice.gov.uk/specialist-forecasts/coast-and-sea/print/inshore-waters-forecast";
+const METOFFICE_INSHORE_URL_PROXY = "https://r.jina.ai/" + METOFFICE_INSHORE_URL; // CORS-friendly fallback
+
+// --- CL-074 (extension): French coast ...
+// Météo-France coastal zone pages are largely JS-rendered. For now, we store
+// a tidy set of authoritative links for the relevant zones and let the user
+// paste/trim key bits into the free-text field if desired.
+const METEOFRANCE_COAST_ZONES = [
+  {
+    label: "Baie de Somme / Cap de la Hague",
+    url: "https://meteofrance.com/meteo-marine/baie-de-somme-cap-de-la-hague/BMSCOTE-01-02"
+  },
+  {
+    label: "Cap de la Hague / Penmarc'h",
+    url: "https://meteofrance.com/meteo-marine/cap-de-la-hague-penmarc-h/BMSCOTE-01-03"
+  },
+  {
+    label: "Penmarc'h / Anse de l'Aiguillon",
+    url: "https://meteofrance.com/meteo-marine/penmarc-h-anse-de-l-aiguillon/BMSCOTE-01-04"
+  }
+];
+
+function looksLikeFrenchCoastTrip(latA, lonA, latB, lonB){
+  // Very rough bbox: Seine / Channel coast down to around La Rochelle.
+  const inBox = (lat, lon) =>
+    typeof lat === "number" && typeof lon === "number" &&
+    lat >= 45.5 && lat <= 50.8 && lon >= -6.0 && lon <= 3.0;
+  return inBox(latA, lonA) || inBox(latB, lonB);
+}
+
+function setWeatherStatus(msg){
+  if (!weatherFetchStatus) return;
+  weatherFetchStatus.textContent = msg || "";
+}
+
+function pickInshoreAreaForLatLon(lat, lon){
+  // Biased for UK / Channel cruising. Returns an exact heading from the Met Office page.
+  // lat, lon are decimal degrees (lon west is negative).
+  if (typeof lat !== "number" || typeof lon !== "number") return null;
+
+  // Channel Islands (rough bbox)
+  if (lat < 49.75 && lon > -3.2 && lon < -1.4) return "Channel Islands";
+
+  // South & SE England
+  if (lat >= 49.75 && lat <= 52.0 && lon >= -6.5 && lon <= 2.5){
+    // East/SE (Thames/Kent/Sussex): North Foreland to Selsey Bill
+    if (lon >= 0.0 && lat >= 50.2) return "North Foreland to Selsey Bill";
+    // Central South (Sussex/Hants/Dorset): Selsey Bill to Lyme Regis
+    if (lon >= -3.0) return "Selsey Bill to Lyme Regis";
+    // SW (Devon/Cornwall south + Scilly)
+    return "Lyme Regis to Lands End including the Isles of Scilly";
+  }
+
+  // Fallbacks for other UK regions (kept simple; can be refined later)
+  if (lat > 52.0 && lon > -6.5 && lon < 2.5) return "Gibraltar Point to North Foreland";
+  if (lat > 55.0 && lon > -6.5 && lon < 2.5) return "Cape Wrath to Rattray Head including Orkney";
+
+  return null;
+}
+
+function getInshoreAreasForCurrentPassage(){
+  const p = getCurrentPassage();
+  if (!p) return [];
+
+  const fromName = (planFrom?.value || "").trim();
+  const toName   = (planTo?.value || "").trim();
+
+  const fromC = getPortCoords(fromName);
+  const toC   = getPortCoords(toName);
+
+  const areas = [];
+  const a1 = fromC ? pickInshoreAreaForLatLon(fromC.lat, fromC.lon) : null;
+  const a2 = toC   ? pickInshoreAreaForLatLon(toC.lat, toC.lon) : null;
+
+  if (a1) areas.push(a1);
+  if (a2 && a2 !== a1) areas.push(a2);
+
+  return areas;
+}
+
+function parseMetOfficeInshore(htmlText){
+  // Accepts either HTML or Jina's plain-text "rendered" output.
+  const result = { issued: null, areas: {} };
+
+  // Try DOM parse first
+  try{
+    const doc = new DOMParser().parseFromString(htmlText, "text/html");
+    const issuedEl = doc.querySelector("h1, h2, p, div");
+    const wholeText = doc.body ? doc.body.textContent : htmlText;
+    const issuedMatch = wholeText.match(/Issued by the Met Office at\s+([^\n]+)\s+on\s+([^\n]+)/i);
+    if (issuedMatch) result.issued = `Issued ${issuedMatch[1].trim()} on ${issuedMatch[2].trim()}`;
+
+    const h3s = Array.from(doc.querySelectorAll("h3"));
+    if (h3s.length){
+      for (const h of h3s){
+        const title = (h.textContent || "").trim().replace(/\s+/g, " ");
+        if (!title) continue;
+
+        let text = "";
+        let n = h.nextElementSibling;
+        while (n && n.tagName !== "H3"){
+          const t = (n.textContent || "").trim();
+          if (t) text += (text ? "\n" : "") + t.replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+          n = n.nextElementSibling;
+        }
+        if (text) result.areas[title] = text;
+      }
+      return result;
+    }
+  }catch(e){
+    // fall through to text parse
+  }
+
+  // Plain-text parse (works on the Jina proxy text we see in print view)
+  const issuedMatch = htmlText.match(/Issued by the Met Office at\s+([^\n]+)\s+on\s+([^\n]+)/i);
+  if (issuedMatch) result.issued = `Issued ${issuedMatch[1].trim()} on ${issuedMatch[2].trim()}`;
+
+  const lines = htmlText.split("\n");
+  let current = null;
+  let buf = [];
+  const flush = () => {
+    if (current && buf.length){
+      result.areas[current] = buf.join("\n").trim();
+    }
+    buf = [];
+  };
+
+  for (const rawLine of lines){
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    // In the print view the area headings are shown like "### North Foreland to Selsey Bill"
+    const m = line.match(/^###\s+(.*)$/);
+    if (m){
+      flush();
+      current = m[1].trim();
+      continue;
+    }
+    if (line === "* * *") continue;
+    if (current) buf.push(line);
+  }
+  flush();
+  return result;
+}
+
+async function fetchTextWithFallback(url){
+  // 1) direct fetch (may fail due to CORS on some setups)
+  try{
+    const r = await fetch(url, { cache: "no-store" });
+    if (r && r.ok) return await r.text();
+  }catch(e){
+    // ignore
+  }
+  // 2) proxy fallback (CORS-friendly)
+  const r2 = await fetch(METOFFICE_INSHORE_URL_PROXY, { cache: "no-store" });
+  if (!r2.ok) throw new Error("Proxy fetch failed");
+  return await r2.text();
+}
+
+async function fetchInshoreWeatherForCurrent(){
+  if (!btnFetchWeather || !planWeather) return;
+  const areasWanted = getInshoreAreasForCurrentPassage();
+  if (!areasWanted.length){
+    setWeatherStatus("Add Origin & Destination (with coords) first.");
+    return;
+  }
+
+  btnFetchWeather.disabled = true;
+  setWeatherStatus(`Fetching: ${areasWanted.join(" • ")} ...`);
+
+  try{
+    let addedFranceLinks = false;
+    const raw = await fetchTextWithFallback(METOFFICE_INSHORE_URL);
+    const parsed = parseMetOfficeInshore(raw);
+
+    const blocks = [];
+    const issued = parsed.issued ? `Met Office Inshore Waters (${parsed.issued})` : "Met Office Inshore Waters";
+    blocks.push(issued);
+
+    for (const area of areasWanted){
+      // Exact match first, else fuzzy (case/space)
+      let text = parsed.areas[area];
+      if (!text){
+        const key = Object.keys(parsed.areas).find(k => k.toLowerCase() === area.toLowerCase());
+        if (key) text = parsed.areas[key];
+      }
+      if (!text){
+        // final fallback: contains
+        const key = Object.keys(parsed.areas).find(k => k.toLowerCase().includes(area.toLowerCase()));
+        if (key) text = parsed.areas[key];
+      }
+      if (!text){
+        blocks.push(`\n${area}\n(Area not found in fetched page — you may need to update mapping.)`);
+      }else{
+        blocks.push(`\n${area}\n${text}`);
+      }
+    }
+
+    // French coast (Seine → La Rochelle): add authoritative Météo-France zone links.
+    // (We keep this brief to match the Met Office snapshot style.)
+    try{
+      const pNow = getCurrentPassage();
+      const fromName = (pNow?.plan?.from || planFrom?.value || "").trim();
+      const toName   = (pNow?.plan?.to   || planTo?.value   || "").trim();
+      const a = getPortCoords(fromName);
+      const b = getPortCoords(toName);
+      const shouldAddFrance = looksLikeFrenchCoastTrip(a?.lat, a?.lon, b?.lat, b?.lon);
+      if (shouldAddFrance){
+        addedFranceLinks = true;
+        blocks.push("\nMétéo-France coastal zones (Seine → La Rochelle)");
+        for (const z of METEOFRANCE_COAST_ZONES){
+          blocks.push(`- ${z.label}: ${z.url}`);
+        }
+        blocks.push("(Tip: open a link, copy the relevant bits, then trim in here if you want a shorter log entry.)");
+      }
+    }catch(e){
+      // Non-fatal: UK snapshot still works.
+    }
+
+    planWeather.value = blocks.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+
+    // persist immediately
+    const p = getCurrentPassage();
+    if (p){
+      p.plan.weather = planWeather.value.trim();
+      p.plan.weather_source = addedFranceLinks ? "metoffice_inshore_waters_print;meteofrance_coast_links" : "metoffice_inshore_waters_print";
+      p.plan.weather_fetched_at = new Date().toISOString();
+      savePassages();
+    }
+
+    setWeatherStatus("Fetched ✓ (you can edit the text).");
+  }catch(e){
+    console.warn("Weather fetch failed", e);
+    setWeatherStatus("Fetch failed — you can still type it manually.");
+  }finally{
+    btnFetchWeather.disabled = false;
+  }
+}
+
+if (btnFetchWeather){
+  btnFetchWeather.addEventListener("click", (e) => {
+    e.preventDefault();
+    fetchInshoreWeatherForCurrent();
+  });
+}
+
 // Save plan -> remember ports, ensure tide stations, then jump to Log
-planForm.addEventListener("submit", (e) => {
+planForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const p = getCurrentPassage();
   if (!p) return;
@@ -1376,7 +1951,18 @@ planForm.addEventListener("submit", (e) => {
 
   p.plan.dailySummaries = readDailySummariesFromForm();
 
+  // Before saving ports, run the "new port" flow (lookup + user confirmation).
+  // This prevents partial names (e.g. "Ca", "Car") being persisted.
+  try{
+    await maybeSaveNewPort(p.plan.from);
+    await maybeSaveNewPort(p.plan.to);
+  }catch(e){
+    console.warn("Port confirmation flow failed", e);
+  }
+
   savePassages();
+
+  // If ports already exist, update MRU.
   rememberPort(p.plan.from);
   rememberPort(p.plan.to);
 
@@ -2043,6 +2629,7 @@ homeNewPassageBtn.addEventListener("click", () => {
 loadPassages();
 loadPorts();
 setupPortAutocomplete();
+setupPortCoordConfirmation();
 setupPortsManagerModal();
 refreshPortUI();
 applyTheme(localStorage.getItem(THEME_KEY) || "day");
