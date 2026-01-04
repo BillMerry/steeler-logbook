@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>STEELER Logbook</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="styles.css" />
+
+  <!-- PWA bits -->
+  <link rel="manifest" href="manifest.json">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="STEELER Logbook">
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-top">
+      <h1>STEELER Logbook</h1>
+      <button id="themeToggleBtn" class="btn btn-secondary btn-small">Night</button>
+    </div>
+
+    <div class="header-bottom">
+      <div class="header-leftline">
+        <div id="headerPassageMain" class="header-main"></div>
+        <div id="headerSunrise" class="header-sunrise-inline"></div>
+      </div>
+
+      <div class="header-right">
+        <div id="headerCrew" class="header-crew"></div>
+      </div>
+    </div>
+
+    <nav class="tabs">
+      <button class="tab-btn active" data-tab="homeTab">Home</button>
+      <button class="tab-btn" data-tab="planTab">Plan</button>
+      <button class="tab-btn" data-tab="logTab">Log</button>
+      <button class="tab-btn" data-tab="settingsTab">Settings</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- HOME TAB -->
+    <section id="homeTab" class="tab active">
+      <section class="home-actions">
+        <button id="homeNewPassageBtn" class="btn btn-primary">+ New Passage</button>
+      </section>
+
+      <section class="home-passages">
+        <h2>Passages</h2>
+        <div id="homePassageList" class="passage-list"></div>
+      </section>
+      <section class="home-hint">
+        <p class="hint">Tip: Backup/Restore and port management live under <strong>Settings</strong>.</p>
+      </section>
+</section>
+
+    <!-- PLAN TAB -->
+    <section id="planTab" class="tab">
+      <form id="planForm" class="form">
+        <h2>Passage Plan</h2>
+
+        <div class="row row-date">
+          <label class="field-compact">
+            Date
+            <input type="date" id="planDate" required />
+          </label>
+
+          <label class="field-compact">
+            Sunrise / Sunset
+            <input type="text" id="planSunriseSet" placeholder="e.g. 05:12 / 21:18 (BST)" />
+          </label>
+        </div>
+
+        <div class="grid-2">
+          <label>
+            Origin
+            <input type="text" id="planFrom" placeholder="e.g. St Peter Port" autocomplete="off" />
+            <div id="planFromSuggest" class="port-suggest hidden"></div>
+          </label>
+          <label>
+            Intended Destination
+            <input type="text" id="planTo" placeholder="e.g. Lymington" autocomplete="off" />
+            <div id="planToSuggest" class="port-suggest hidden"></div>
+          </label>
+
+          <label>
+            Vessel
+            <input type="text" id="planVessel" value="STEELER" />
+          </label>
+          <label>
+            Skipper
+            <input type="text" id="planSkipper" placeholder="e.g. Bill" />
+          </label>
+
+          <label class="grid-span-2">
+            Crew
+            <input type="text" id="planCrew" placeholder="Names (optional)" />
+          </label>
+        </div>
+<h3>Tides</h3>
+        <div class="grid-2">
+          <label>
+            Tidal Coefficient
+            <input type="text" id="planTidalCoeff" placeholder="e.g. Neaps +2 / 85%" />
+          </label>
+        </div>
+
+        <div class="tide-stations-header">
+          <h4>Tide Stations</h4>
+          <button type="button" id="addTideStationBtn" class="btn btn-secondary btn-small">
+            + Add Station
+          </button>
+        </div>
+        <div id="tideStationsContainer" class="grid-container"></div>
+
+        <h3>Tidal Currents / Flows</h3>
+        <textarea id="planCurrents" rows="3" placeholder="Notes on tidal streams, overfalls, gates, etc."></textarea>
+
+        <h3>Weather (Inshore Waters)</h3>
+        <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;margin-bottom:0.35rem">
+          <button id="btnFetchWeather" class="btn btn-secondary btn-small" type="button">Fetch Met Office</button>
+          <button id="btnFetchWeatherFR" class="btn btn-secondary btn-small" type="button">Fetch Météo-France</button>
+          <div id="weatherFetchStatus" class="hint"></div>
+        </div>
+        <textarea id="planWeather" rows="6" placeholder="Met Office Inshore Waters forecast summary..."></textarea>
+
+        <h3>Comms / Pilotage Notes</h3>
+        <textarea id="planComms" rows="4" placeholder="VHF channels, phone numbers, pilotage notes..."></textarea>
+
+        <h3>Daily Summary</h3>
+        <div id="dailySummariesContainer" class="grid-container ds-grid"></div>
+        <button type="button" id="addDailySummaryBtn" class="btn btn-secondary btn-small">
+          + Add Day
+        </button>
+
+        <button type="submit" class="btn btn-primary plan-save-btn">Save Plan</button>
+      </form>
+    </section>
+
+    <!-- LOG TAB -->
+    <section id="logTab" class="tab">
+      <div class="log-header">
+        <div class="log-header-left">
+          <button id="addEntryBtn" class="btn btn-primary">+ New Log Entry</button>
+          <button id="engineStartBtn" class="btn btn-secondary btn-small">Engine start</button>
+          <button id="slipLinesBtn" class="btn btn-secondary btn-small">Slip</button>
+          <button id="dockLinesBtn" class="btn btn-secondary btn-small">Dock</button>
+          <button id="shutdownBtn" class="btn btn-secondary btn-small">Shutdown</button>
+        </div>
+        <div class="log-header-right">
+          <button id="splitViewBtn" class="btn btn-secondary btn-small view-btn active">Split view</button>
+          <button id="expandPlanBtn" class="btn btn-secondary btn-small view-btn">Plan full</button>
+          <button id="expandLogBtn" class="btn btn-secondary btn-small view-btn">Log full</button>
+          <button id="exportCsvBtn" class="btn btn-secondary btn-small">Export CSV</button>
+        </div>
+      </div>
+
+      <div class="log-layout split" id="logLayout">
+        <aside class="plan-summary scroll-pane" id="planSummaryPanel"></aside>
+
+        <section class="log-table-wrapper scroll-pane">
+          <table class="log-table">
+            <thead>
+              <tr>
+                <th rowspan="2">TIME</th>
+                <th rowspan="2">COG</th>
+                <th rowspan="2">SPEED</th>
+                <th rowspan="2">RPM</th>
+                <th rowspan="2">ENG T/P</th>
+                <th colspan="2">LOG</th>
+                <th rowspan="2">FUEL USED</th>
+                <th rowspan="2">NOTES / ACTIONS</th>
+              </tr>
+              <tr>
+                <th>W</th>
+                <th>G</th>
+              </tr>
+            </thead>
+            <tbody id="logEntriesContainer"></tbody>
+          </table>
+
+          <div id="logSummaryPanel" class="log-summary"></div>
+          <p id="logEmptyMessage" class="log-empty">
+            No log entries yet. Tap “+ New Log Entry”.
+          </p>
+        </section>
+      </div>
+    </section>
+  
+    <!-- SETTINGS TAB -->
+    <section id="settingsTab" class="tab">
+      <section class="settings-section">
+        <h2>Settings</h2>
+
+        <div class="settings-card">
+          <h3>Backup &amp; Restore</h3>
+          <div class="backup-row">
+            <button id="exportBackupBtn" class="btn btn-secondary">Backup</button>
+            <button id="importBackupBtn" class="btn btn-secondary">Restore</button>
+            <input id="importFileInput" type="file" accept="application/json,.json" hidden>
+          </div>
+          <p class="hint">Restore replaces current data on this device.</p>
+        </div>
+
+        <div class="settings-card">
+          <h3>Ports</h3>
+          <div class="settings-row">
+            <button id="managePortsBtn" class="btn btn-secondary">Manage Ports</button>
+          </div>
+          <p class="hint">Add/remove ports and (optionally) store lat/long for Sunrise/Sunset calculations.</p>
+        </div>
+
+        <div class="settings-card">
+          <h3>Diagnostics</h3>
+          <div class="settings-row">
+            <button id="resetCacheBtn" class="btn btn-secondary">Reset PWA Cache</button>
+          </div>
+          <p class="hint">If buttons stop responding after an update, use this to clear cached files (does not delete your logbook data).</p>
+        </div>
+      </section>
+    </section>
+
+  </main>
+
+  <!-- Modal (numeric-friendly) -->
+  <div id="modalOverlay" class="modal-overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+      <div class="modal-title" id="modalTitle">Modal</div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-actions">
+        <button id="modalCancelBtn" class="btn btn-secondary">Cancel</button>
+        <button id="modalOkBtn" class="btn btn-primary">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <footer class="app-footer">
+    <small>Data stored locally on this device · STEELER Logbook v<span id="appVersion"></span></small>
+  </footer>
+
+
+  <!-- Ports Manager Modal -->
+  <div id="portsModal" class="modal hidden" aria-hidden="true">
+    <div id="portsModalOverlay" class="modal-overlay hidden"></div>
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-label="Manage Ports">
+      <div class="modal-header">
+        <div class="modal-title">Manage Ports</div>
+        <button type="button" id="portsModalClose" class="modal-close" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-help">Remove typos/tests from the saved port list.</div>
+        <div id="portsManagerList" class="ports-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
