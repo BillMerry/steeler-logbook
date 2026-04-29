@@ -4,7 +4,26 @@ const STORAGE_KEY = "steeler_logbook_passages_v5";
 const THEME_KEY   = "steeler_logbook_theme_v1";
 const PORTS_KEY   = "steeler_logbook_ports_v1";
 
-const APP_VERSION = "0.9.1.17";
+const APP_VERSION = "0.9.17";
+
+const storageSaveWarningsShown = new Set();
+
+function warnStorageSaveFailed(label, error){
+  console.warn(`Failed to save ${label}`, error);
+  if (storageSaveWarningsShown.has(label)) return;
+  storageSaveWarningsShown.add(label);
+  alert(`Warning: ${label} could not be saved on this device. Your latest changes may not be stored. Please make a backup when possible.`);
+}
+
+function saveLocalStorageItem(key, value, label){
+  try{
+    localStorage.setItem(key, value);
+    return true;
+  }catch(e){
+    warnStorageSaveFailed(label, e);
+    return false;
+  }
+}
 
 // --- Safety / Emergency Info (v0.7.16) ----------------------------
 
@@ -18,11 +37,7 @@ function loadSafetyInfo(){
 }
 
 function saveSafetyInfo(obj){
-  try{
-    localStorage.setItem(SAFETY_INFO_KEY, JSON.stringify(obj));
-  }catch(e){
-    console.warn("Failed to save safety info", e);
-  }
+  saveLocalStorageItem(SAFETY_INFO_KEY, JSON.stringify(obj), "Safety / Emergency Info");
 }
 
 function getSafetyInfo(){
@@ -94,11 +109,7 @@ function loadEcSettings(){
 }
 
 function saveEcSettings(obj){
-  try{
-    localStorage.setItem(EC_SETTINGS_KEY, JSON.stringify(obj));
-  }catch(e){
-    console.warn("Failed to save EC settings", e);
-  }
+  saveLocalStorageItem(EC_SETTINGS_KEY, JSON.stringify(obj), "emergency contact settings");
 }
 
 function getEcSettings(){
@@ -431,21 +442,17 @@ function saveSafetyInfoFromSettingsFields(){
 }
 
 // ---------------------------------------------------------------------------
-// Emergency reset hook
+// Emergency cache reset hook
 // ---------------------------------------------------------------------------
 // Use: http://localhost:8001/?reset=1
 // This runs *before* any UI init so it works even if buttons/modals are broken.
+// It must never delete logbook or settings data.
 (function earlyResetHook(){
   try{
     const qs = new URLSearchParams(window.location.search);
     if (!qs.has("reset")) return;
 
-    // Clear local app data
-    try{ localStorage.removeItem(STORAGE_KEY); }catch(e){}
-    try{ localStorage.removeItem(THEME_KEY); }catch(e){}
-    try{ localStorage.removeItem(PORTS_KEY); }catch(e){}
-
-    // Nuke SW + cache storage
+    // Clear SW + cache storage only; localStorage contains user logbook data.
     const doReload = () => {
       // Remove the query param so we don't loop
       const cleanUrl = window.location.origin + window.location.pathname;
@@ -1144,9 +1151,10 @@ function loadPassages() {
 
 function savePassages() {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(passages));
+    saveLocalStorageItem(STORAGE_KEY, JSON.stringify(passages), "passages");
   } catch (e) {
     console.error("Failed to save passages", e);
+    warnStorageSaveFailed("passages", e);
   }
 }
 
@@ -1187,12 +1195,13 @@ function loadPorts() {
 function savePorts() {
   try {
     const payload = { all: knownPorts, recent: recentPorts };
-    localStorage.setItem(PORTS_KEY, JSON.stringify(payload));
+    saveLocalStorageItem(PORTS_KEY, JSON.stringify(payload), "ports");
     // If Plan comms is empty, auto-fill from updated port data
     try { updatePlanCommsFromPorts(); } catch(e) {}
     try { updatePlanSummaryPanel(); } catch(e) {}
   } catch (e) {
     console.warn("Failed to save ports", e);
+    warnStorageSaveFailed("ports", e);
   }
 }
 
@@ -2253,7 +2262,7 @@ const modalOkBtn     = document.getElementById("modalOkBtn");
 
 function applyTheme(theme) {
   document.body.dataset.theme = theme;
-  localStorage.setItem(THEME_KEY, theme);
+  saveLocalStorageItem(THEME_KEY, theme, "theme setting");
   if (themeToggleBtn) themeToggleBtn.textContent = theme === "night" ? "Day" : "Night";
 }
 
@@ -3425,14 +3434,15 @@ function importBackupFile(file) {
       if (!ok) return;
 
       passages = obj.data.passages;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(passages));
-						if (obj.data.safetyInfo) {
-								try {
-										localStorage.setItem(SAFETY_INFO_KEY, JSON.stringify(obj.data.safetyInfo));
-								} catch(e) {
-										console.warn("Failed to restore Safety / Emergency Info", e);
-								}
-						}
+      saveLocalStorageItem(STORAGE_KEY, JSON.stringify(passages), "passages");
+							if (obj.data.safetyInfo) {
+									try {
+											saveLocalStorageItem(SAFETY_INFO_KEY, JSON.stringify(obj.data.safetyInfo), "Safety / Emergency Info");
+									} catch(e) {
+											console.warn("Failed to restore Safety / Emergency Info", e);
+											warnStorageSaveFailed("Safety / Emergency Info", e);
+									}
+							}
       // Legacy support: if an older full backup still contains ports, preserve current ports.
       // Ports are now managed separately via Export/Import Ports.
       applyTheme(obj.data.theme || "day");
@@ -5450,14 +5460,14 @@ function loadAbbrDb(options){
   try{
     if (opts.forceReset){
       const d = shippedFlat();
-      localStorage.setItem(ABBR_DB_KEY, JSON.stringify(d));
+      saveLocalStorageItem(ABBR_DB_KEY, JSON.stringify(d), "weather abbreviations");
       return d;
     }
 
     const raw = localStorage.getItem(ABBR_DB_KEY);
     if (!raw){
       const d = shippedFlat();
-      localStorage.setItem(ABBR_DB_KEY, JSON.stringify(d));
+      saveLocalStorageItem(ABBR_DB_KEY, JSON.stringify(d), "weather abbreviations");
       return d;
     }
 
@@ -5470,7 +5480,7 @@ function loadAbbrDb(options){
         db.rules = mergeById(db.rules, shippedFlat().rules);
         db.seededFromDefaults = true;
         db.updatedAt = new Date().toISOString();
-        localStorage.setItem(ABBR_DB_KEY, JSON.stringify(db));
+        saveLocalStorageItem(ABBR_DB_KEY, JSON.stringify(db), "weather abbreviations");
       }
       return db;
     }
@@ -5481,13 +5491,13 @@ function loadAbbrDb(options){
     migrated.rules = mergeById(legacyRules, migrated.rules); // keep legacy first (user wins on duplicate ids)
     migrated.seededFromDefaults = true;
     migrated.updatedAt = new Date().toISOString();
-    localStorage.setItem(ABBR_DB_KEY, JSON.stringify(migrated));
+    saveLocalStorageItem(ABBR_DB_KEY, JSON.stringify(migrated), "weather abbreviations");
     return migrated;
 
   }catch(e){
     // Fallback: restore shipped defaults
     const d = shippedFlat();
-    localStorage.setItem(ABBR_DB_KEY, JSON.stringify(d));
+    saveLocalStorageItem(ABBR_DB_KEY, JSON.stringify(d), "weather abbreviations");
     return d;
   }
 }
@@ -5495,8 +5505,7 @@ function loadAbbrDb(options){
 function saveAbbrDb(db){
   try{
     db.updatedAt = new Date().toISOString();
-    localStorage.setItem(ABBR_DB_KEY, JSON.stringify(db));
-    return true;
+    return saveLocalStorageItem(ABBR_DB_KEY, JSON.stringify(db), "weather abbreviations");
   }catch(e){ return false; }
 }
 
@@ -8995,7 +9004,7 @@ function setupWeatherShorthandEditorUI(){
           saveDb({ ...getDb(), ...obj, rules: obj.rules });
         } else {
           // Store raw and let loadAbbrDb normalise on next call
-          localStorage.setItem(ABBR_DB_KEY, JSON.stringify(obj));
+          saveLocalStorageItem(ABBR_DB_KEY, JSON.stringify(obj), "weather abbreviations");
           loadAbbrDb(); // normalise + save
         }
         render();
@@ -9276,7 +9285,7 @@ function injectSafetyEmergencySettingsBlock(){
 // --- Initial load --------------------------------------------------
 
 if (new URLSearchParams(location.search).has("reset")) {
-  // Emergency recovery: add ?reset=1 to the URL and reload
+  // Emergency cache recovery: add ?reset=1 to the URL and reload
   resetPwaCache({ silent:true });
 } else {
   loadPassages();
