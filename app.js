@@ -8641,9 +8641,8 @@ function __wxAbbrFindSettingsContainer() {
 
   const elPorts  = document.getElementById("managePortsBtn");
   const elBackup = document.getElementById("exportBackupBtn");
-  const elCache  = document.getElementById("resetPwaCacheBtn");
 
-  const els = [elPorts, elBackup, elCache].filter(Boolean);
+  const els = [elPorts, elBackup].filter(Boolean);
   if (els.length < 2) return null;
 
   const chain = (el) => {
@@ -8683,13 +8682,11 @@ function reorderSettingsBlocksAndInjectWx() {
 
   const portsBtn  = document.getElementById("managePortsBtn");
   const backupBtn = document.getElementById("exportBackupBtn");
-  const cacheBtn  = document.getElementById("resetPwaCacheBtn");
 
   const portsBlock  = __wxAbbrBlockForEl(portsBtn, container);
   const backupBlock = __wxAbbrBlockForEl(backupBtn, container);
-  const cacheBlock  = __wxAbbrBlockForEl(cacheBtn, container);
 
-  if (!portsBlock || !backupBlock || !cacheBlock) return;
+  if (!portsBlock || !backupBlock) return;
 
   // Create Weather Shorthand block (card) if not already present
   let wxBlock = document.getElementById("wxAbbrSettingsBlock");
@@ -8714,14 +8711,13 @@ function reorderSettingsBlocksAndInjectWx() {
   }
 
   // Detach blocks first (preserve any other content)
-  const blocks = [portsBlock, wxBlock, backupBlock, cacheBlock];
+  const blocks = [portsBlock, wxBlock, backupBlock];
   blocks.forEach(b => { if (b && b.parentElement === container) container.removeChild(b); });
 
-  // Re-insert in desired order: Ports, Weather Shorthand, Backup, Cache
+  // Re-insert in desired order: Ports, Weather Shorthand, Backup
   container.appendChild(portsBlock);
   container.appendChild(wxBlock);
   container.appendChild(backupBlock);
-  container.appendChild(cacheBlock);
 
   // Now wire up editor UI once
   try { setupWeatherShorthandEditorUI(); } catch (e) { console.warn("wxAbbr UI setup failed", e); }
@@ -9301,10 +9297,6 @@ if (new URLSearchParams(location.search).has("reset")) {
   try { reorderSettingsBlocksAndInjectWx(); } catch (e) { console.warn('reorderSettingsBlocksAndInjectWx failed', e); }
 		try { migrateLegacyEcSettingsIntoSafetyInfo(); } catch (e) { console.warn('migrateLegacyEcSettingsIntoSafetyInfo failed', e); }
 		try { injectSafetyEmergencySettingsBlock(); } catch (e) { console.warn('injectSafetyEmergencySettingsBlock failed', e); }
-
-  // Settings: Reset PWA Cache button (keeps log data)
-  const resetBtn = document.getElementById("resetPwaCacheBtn");
-  if (resetBtn) resetBtn.addEventListener("click", () => resetPwaCache());
 
   refreshHomePassageList();
 
