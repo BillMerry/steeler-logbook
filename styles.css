@@ -1726,20 +1726,6 @@ body.st-app-shell{
   box-shadow:0 1px 0 rgba(32,36,40,0.03);
 }
 
-.st-build-staging .app-header::after{
-  content:"STAGING";
-  position:absolute;
-  right:var(--st-space-5);
-  top:var(--st-space-2);
-  border:1px solid var(--st-accent-border);
-  border-radius:999px;
-  color:var(--st-accent-strong);
-  background:var(--st-accent-soft);
-  font-size:0.68rem;
-  font-weight:800;
-  letter-spacing:0.08em;
-  padding:0.12rem 0.42rem;
-}
 
 .app-header-logo{
   max-height:5.2rem;
@@ -2664,10 +2650,6 @@ body[data-theme="night"] .settings-card-icon{
 .btn,
 .btn-secondary{
   min-height:40px;
-}
-
-.st-build-staging .app-header::after{
-  top:0.35rem;
 }
 
 .log-status-strip{
