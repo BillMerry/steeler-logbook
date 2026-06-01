@@ -8,7 +8,7 @@ const DPP_WAYPOINTS_KEY = "steeler_dpp_waypoints_v1";
 const FUEL_MANAGEMENT_KEY = "steeler_fuel_management_v1";
 const LOG_SPLIT_RATIO_KEY = "steeler_log_split_ratio_v1";
 
-const APP_VERSION = "1.1.0";
+const APP_VERSION = "1.1.1";
 
 const storageSaveWarningsShown = new Set();
 const storageRecoveryWarningsShown = new Set();
@@ -5304,9 +5304,10 @@ function scheduleAutoSunSync(){
     p.plan.to   = planTo.value.trim();
     autoComputeSunriseSetForCurrent();
 
-    // Group C: CL-076-10 — auto-fill moon phase (does not overwrite manual edits)
-    if (planMoonPhase && !planMoonPhase.value.trim() && planDate.value) {
-      planMoonPhase.value = normaliseMoonPhaseLabel(getMoonPhaseLabel(planDate.value));
+    if (planMoonPhase && planDate.value) {
+      const moonPhaseValue = normaliseMoonPhaseLabel(getMoonPhaseLabel(planDate.value));
+      planMoonPhase.value = moonPhaseValue;
+      p.plan.moonPhase = moonPhaseValue;
     }
   }, 180);
 }
@@ -6717,6 +6718,13 @@ async function openEngineStartEntryDialog(p, legIdx, entry = null) {
     }
   }
   const prevEnv = existing.engineHoursStart ? existing : ((p.plan && p.plan.engineStartEnv) ? { ...p.plan.engineStartEnv } : {});
+  const engineStartChecks = [
+    { id: "esVhfCheck", label: "VHF CHECK COMPLETE" },
+    { id: "esDcDcCheck", label: "DC/DC CONV ON" },
+    { id: "esPlotterTrackCheck", label: "START TRACK (PLOTTER)" },
+    { id: "esOtherTrackCheck", label: "START TRACK (OTHER)" },
+    { id: "esLogsZeroedCheck", label: "LOGS ZEROED" }
+  ];
 
   return await new Promise((resolve) => {
     showModal({
@@ -6725,96 +6733,99 @@ async function openEngineStartEntryDialog(p, legIdx, entry = null) {
       bodyHtml: `
         <div class="st-task-sheet engine-start-grid">
 
-          <div class="engine-start-title st-modal-section-title">Start values</div>
-          <div class="engine-start-row engine-start-values st-modal-section">
-            <label class="entry-dialog-field">
-              <span>Time</span>
-              <input id="esTime" type="text" inputmode="numeric" value="${escapeHtml(entry?.time ? timeOnlyFromIso(entry.time) : timeOnlyFromIso(localDateTimeInputValue(new Date())))}">
-            </label>
+          <div class="engine-start-main-grid">
+            <div class="engine-start-fields">
+              <div class="engine-start-title st-modal-section-title">Start values</div>
+              <div class="engine-start-row engine-start-values st-modal-section">
+                <label class="entry-dialog-field">
+                  <span>Time</span>
+                  <input id="esTime" type="text" inputmode="numeric" value="${escapeHtml(entry?.time ? timeOnlyFromIso(entry.time) : timeOnlyFromIso(localDateTimeInputValue(new Date())))}">
+                </label>
 
-            <label class="entry-dialog-field">
-              <span>POB</span>
-              <input id="esPob" type="number" inputmode="numeric" step="1" min="1" value="${escapeHtml(entry?.pob || p.pob || '')}">
-            </label>
+                <label class="entry-dialog-field">
+                  <span>POB</span>
+                  <input id="esPob" type="number" inputmode="numeric" step="1" min="1" value="${escapeHtml(entry?.pob || p.pob || '')}">
+                </label>
 
-            <label class="entry-dialog-field">
-              <span>Fuel R</span>
-              <input id="esFuelR" type="number" inputmode="numeric" step="1" value="${escapeHtml(prefillFuR)}">
-            </label>
+                <label class="entry-dialog-field">
+                  <span>Fuel R</span>
+                  <input id="esFuelR" type="number" inputmode="numeric" step="1" value="${escapeHtml(prefillFuR)}">
+                </label>
 
-            <label class="entry-dialog-field">
-              <span>Fuel C</span>
-              <input id="esFuelC" type="number" inputmode="numeric" step="1" value="${escapeHtml(existing.fuelStartPercentC || '')}">
-            </label>
+                <label class="entry-dialog-field">
+                  <span>Fuel C</span>
+                  <input id="esFuelC" type="number" inputmode="numeric" step="1" value="${escapeHtml(existing.fuelStartPercentC || '')}">
+                </label>
 
-            <label class="entry-dialog-field">
-              <span>Eng hrs</span>
-              <input id="esEh" type="number" inputmode="decimal" step="0.1" value="${escapeHtml(prefillEh)}">
-            </label>
+                <label class="entry-dialog-field">
+                  <span>Eng hrs</span>
+                  <input id="esEh" type="number" inputmode="decimal" step="0.1" value="${escapeHtml(prefillEh)}">
+                </label>
+              </div>
 
-            <div></div>
-          </div>
+              <div class="engine-start-title st-modal-section-title">Environment</div>
+              <div class="engine-start-row engine-start-env st-modal-section">
+                <label class="entry-dialog-field">
+                  <span>Air press</span>
+                  <input id="esAirPress" type="number" inputmode="numeric" step="1" value="${escapeHtml(prevEnv.airPressureMb || '')}">
+                </label>
 
-          <div class="engine-start-title st-modal-section-title">Environment / checks</div>
-          <div class="engine-start-row engine-start-env st-modal-section">
-            <label class="entry-dialog-field">
-              <span>Air press</span>
-              <input id="esAirPress" type="number" inputmode="numeric" step="1" value="${escapeHtml(prevEnv.airPressureMb || '')}">
-            </label>
+                <label class="entry-dialog-field">
+                  <span>Humidity</span>
+                  <input id="esHumidity" type="number" inputmode="numeric" step="1" value="${escapeHtml(prevEnv.humidityPct || '')}">
+                </label>
 
-            <label class="entry-dialog-field">
-              <span>Humidity</span>
-              <input id="esHumidity" type="number" inputmode="numeric" step="1" value="${escapeHtml(prevEnv.humidityPct || '')}">
-            </label>
+                <label class="entry-dialog-field">
+                  <span>Air °C</span>
+                  <input id="esAirTemp" type="number" inputmode="decimal" step="0.1" value="${escapeHtml(prevEnv.airTempC || '')}">
+                </label>
 
-            <label class="entry-dialog-field">
-              <span>Air °C</span>
-              <input id="esAirTemp" type="number" inputmode="decimal" step="0.1" value="${escapeHtml(prevEnv.airTempC || '')}">
-            </label>
+                <label class="entry-dialog-field">
+                  <span>Sea °C</span>
+                  <input id="esSeaTemp" type="number" inputmode="decimal" step="0.1" value="${escapeHtml(prevEnv.seaTempC || '')}">
+                </label>
 
-            <label class="entry-dialog-field">
-              <span>Sea °C</span>
-              <input id="esSeaTemp" type="number" inputmode="decimal" step="0.1" value="${escapeHtml(prevEnv.seaTempC || '')}">
-            </label>
+                <label class="entry-dialog-field">
+                  <span>Wind dir</span>
+                  <select id="esWindDir">
+                    <option value=""></option>
+                    ${['N','NE','E','SE','S','SW','W','NW'].map(opt => `<option value="${opt}" ${String(prevEnv.windDir||'')===opt?'selected':''}>${opt}</option>`).join('')}
+                  </select>
+                </label>
 
-            <label class="entry-dialog-field">
-              <span>Wind dir</span>
-              <select id="esWindDir">
-                <option value=""></option>
-                ${['N','NE','E','SE','S','SW','W','NW'].map(opt => `<option value="${opt}" ${String(prevEnv.windDir||'')===opt?'selected':''}>${opt}</option>`).join('')}
-              </select>
-            </label>
-
-            <label class="entry-dialog-field">
-              <span>Bft</span>
-              <input id="esWindBft" type="number" inputmode="numeric" step="1" min="0" max="12" value="${escapeHtml(prevEnv.windBft || '')}">
-            </label>
-
-            <div></div>
-          </div>
-
-          <div class="engine-start-vhf-notes st-modal-section">
-            <div class="vhf-box">
-              <label>
-                <input id="esVhfCheck" type="checkbox">
-                <span>VHF CHECK COMPLETE</span>
-              </label>
-              <div class="hint">Confirm VHF radio check before recording Engine Start.</div>
+                <label class="entry-dialog-field">
+                  <span>Bft</span>
+                  <input id="esWindBft" type="number" inputmode="numeric" step="1" min="0" max="12" value="${escapeHtml(prevEnv.windBft || '')}">
+                </label>
+              </div>
             </div>
 
+            <div class="vhf-box engine-start-checks-panel">
+              <div class="engine-start-title st-modal-section-title">Checks</div>
+              ${engineStartChecks.map(check => `
+                <label>
+                  <input id="${check.id}" type="checkbox">
+                  <span>${check.label}</span>
+                </label>
+              `).join('')}
+              <div class="hint">Confirm all start checks before recording Engine Start.</div>
+            </div>
+          </div>
+
+          <div class="engine-start-notes-row st-modal-section">
             <label class="entry-dialog-field">
               <span>Notes (optional)</span>
               <textarea id="esNotes" rows="2" class="modal-notes" style="resize:vertical;">${escapeHtml(prevEnv.notes || '')}</textarea>
             </label>
           </div>
-
         </div>
       `,
             
         onOk: () => {
         const vals = getDialogFieldValues(['esTime','esPob','esFuelR','esFuelC','esEh','esAirPress','esHumidity','esAirTemp','esSeaTemp','esWindDir','esWindBft','esNotes']);
-                if (!entry && !document.getElementById("esVhfCheck")?.checked) {
-          alert("Please confirm VHF CHECK COMPLETE before adding Engine Start.");
+        const missingChecks = engineStartChecks.filter(check => !document.getElementById(check.id)?.checked);
+        if (!entry && missingChecks.length) {
+          alert(`Please confirm before adding Engine Start:\n\n${missingChecks.map(check => check.label).join("\n")}`);
           return false;
         }
         if (entry) {
@@ -7890,15 +7901,19 @@ function computeLegMetricsFromEntries(p, legIdx) {
   }
   const nmG = lastG;
 
-  // Under way minutes: Slip -> Dock within this leg (fallback: first->last)
+  // Under way minutes: Slip -> Dock/Shutdown, or Slip -> now while still under way.
   let durationMinutes = null;
   const slipEntry = sorted.find(e => typeof e.notes === 'string' && e.notes.toLowerCase().startsWith('slipped lines'));
-  let dockEntry = null;
+  let endEntry = null;
   if (slipEntry && slipEntry.time) {
-    dockEntry = sorted.find(e => e.time && e.time > slipEntry.time && typeof e.notes === 'string' && e.notes.toLowerCase().startsWith('alongside'));
+    endEntry = sorted.find(e => {
+      if (!e.time || e.time <= slipEntry.time || typeof e.notes !== 'string') return false;
+      const note = e.notes.toLowerCase();
+      return note.startsWith('alongside') || note.startsWith('docked') || note.startsWith('shutdown');
+    });
   }
   const tStart = slipEntry?.time ? new Date(slipEntry.time) : null;
-  const tEnd = dockEntry?.time ? new Date(dockEntry.time) : null;
+  const tEnd = endEntry?.time ? new Date(endEntry.time) : (tStart ? new Date() : null);
   if (tStart && tEnd && !isNaN(tStart) && !isNaN(tEnd)) {
     const ms = tEnd - tStart;
     if (!isNaN(ms) && ms > 0) durationMinutes = Math.round(ms / 60000);
@@ -8043,6 +8058,17 @@ function updateLogSummary() {
 
   logSummaryPanel.innerHTML = html;
 }
+
+window.setInterval(() => {
+  const p = getCurrentPassage();
+  if (!p) return;
+  const legIdx = getCurrentLegIndex(p);
+  const isUnderWay = hasSpecialForLeg(p, "slipped lines", legIdx)
+    && !hasSpecialForLeg(p, "alongside", legIdx)
+    && !hasSpecialForLeg(p, "docked", legIdx)
+    && !hasSpecialForLeg(p, "shutdown", legIdx);
+  if (isUnderWay) updateLogStatusStrip();
+}, 30000);
 
 exportCsvBtn.addEventListener("click", exportCurrentPassageToCsv);
 exportPdfBtn?.addEventListener("click", exportCurrentPassageToPdf);
