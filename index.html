@@ -13,7 +13,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
   <meta name="apple-mobile-web-app-title" content="STEELER Logbook">
 </head>
-<body class="st-app-shell">
+<body class="st-app-shell st-build-staging">
   <header class="app-header st-page-header">
     <img class="app-header-logo" src="icons/steeler-192.png" alt="" aria-hidden="true">
     <div class="header-content">
@@ -47,6 +47,7 @@
     <section id="homeTab" class="tab active">
       <section class="home-actions st-action-row">
         <button id="homeNewPassageBtn" class="btn btn-primary st-button st-button-primary">+ New Passage</button>
+        <button id="homeCopyPassageBtn" class="btn btn-secondary st-button st-button-secondary" type="button">Copy Plan</button>
         <div class="home-tools" aria-label="Passage tools">
           <label class="home-search">
             <span class="sr-only">Search passages</span>
@@ -92,6 +93,15 @@
               <label class="field-compact">
                 Date
                 <input type="date" id="planDate" required />
+              </label>
+
+              <label class="field-compact">
+                Time zone
+                <select id="planTimeZone">
+                  <option value="Europe/London">BST</option>
+                  <option value="UTC">GMT / UTC</option>
+                  <option value="Europe/Paris">CET</option>
+                </select>
               </label>
 
               <label class="field-compact">

@@ -8,7 +8,13 @@ const DPP_WAYPOINTS_KEY = "steeler_dpp_waypoints_v1";
 const FUEL_MANAGEMENT_KEY = "steeler_fuel_management_v1";
 const LOG_SPLIT_RATIO_KEY = "steeler_log_split_ratio_v1";
 
-const APP_VERSION = "1.1.1";
+const APP_VERSION = "1.1.2";
+const DEFAULT_PASSAGE_TIME_ZONE = "Europe/London";
+const PASSAGE_TIME_ZONES = {
+  "Europe/London": "BST",
+  "UTC": "GMT / UTC",
+  "Europe/Paris": "CET"
+};
 
 const storageSaveWarningsShown = new Set();
 const storageRecoveryWarningsShown = new Set();
@@ -630,7 +636,7 @@ function setAppVersionBadge(){
 }
 window.addEventListener("DOMContentLoaded", setAppVersionBadge);
 document.addEventListener("click", (e) => {
-  if (e.target.closest(".entry-del-btn, .passage-delete-btn, .st-swipe-delete-btn")) return;
+  if (e.target.closest(".entry-del-btn, .passage-copy-btn, .passage-delete-btn, .st-swipe-delete-btn")) return;
   if (e.target.closest("tr.show-delete, .passage-card.show-delete, .st-swipe-row.show-delete")) return;
   hideAllSwipeDeleteButtons();
 });
@@ -1569,6 +1575,49 @@ function getCurrentPassage() {
   return passages.find(p => p.id === currentPassageId) || null;
 }
 
+function normalisePassageTimeZone(value) {
+  const tz = String(value || "").trim();
+  return Object.prototype.hasOwnProperty.call(PASSAGE_TIME_ZONES, tz) ? tz : DEFAULT_PASSAGE_TIME_ZONE;
+}
+
+function getDevicePassageTimeZone() {
+  let deviceZone = "";
+  try {
+    deviceZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  } catch {}
+
+  if (Object.prototype.hasOwnProperty.call(PASSAGE_TIME_ZONES, deviceZone)) return deviceZone;
+  if (/^(Europe\/Paris|Europe\/Brussels|Europe\/Berlin|Europe\/Madrid|Europe\/Rome|Europe\/Amsterdam)$/i.test(deviceZone)) return "Europe/Paris";
+  if (/^(Europe\/London|Europe\/Dublin|Europe\/Jersey|Europe\/Guernsey|Europe\/Isle_of_Man)$/i.test(deviceZone)) return "Europe/London";
+  if (/^(UTC|Etc\/UTC|Etc\/GMT|GMT)$/i.test(deviceZone)) return "UTC";
+
+  const offsetMinutes = -new Date().getTimezoneOffset();
+  if (offsetMinutes === 0) return "UTC";
+  if (offsetMinutes === 60 || offsetMinutes === 120) return "Europe/Paris";
+  return DEFAULT_PASSAGE_TIME_ZONE;
+}
+
+function getPassageTimeZone(p) {
+  return normalisePassageTimeZone(p?.plan?.timeZone);
+}
+
+function getCurrentPassageTimeZone() {
+  return getPassageTimeZone(getCurrentPassage());
+}
+
+function getPassageTimeZoneLabel(p) {
+  const tz = getPassageTimeZone(p);
+  return PASSAGE_TIME_ZONES[tz] || tz;
+}
+
+function passageDateToday(p = null) {
+  return localDateInputValue(new Date(), p ? getPassageTimeZone(p) : getDevicePassageTimeZone());
+}
+
+function passageDateTimeNow(p = null) {
+  return localDateTimeInputValue(new Date(), getPassageTimeZone(p));
+}
+
 function escapeHtml(str) {
   if (str == null) return "";
   return String(str)
@@ -1778,6 +1827,7 @@ const tabButtons = document.querySelectorAll(".tab-btn");
 const tabs       = document.querySelectorAll(".tab");
 
 const homeNewPassageBtn = document.getElementById("homeNewPassageBtn");
+const homeCopyPassageBtn = document.getElementById("homeCopyPassageBtn");
 const homePassageList   = document.getElementById("homePassageList");
 const homePassageSearch = document.getElementById("homePassageSearch");
 const homePassageFilterBtn = document.getElementById("homePassageFilterBtn");
@@ -1810,6 +1860,7 @@ let settingsDppLibraryTab = "plans";
 
 const planForm = document.getElementById("planForm");
 const planDate = document.getElementById("planDate");
+const planTimeZone = document.getElementById("planTimeZone");
 const planFrom = document.getElementById("planFrom");
 const planTo   = document.getElementById("planTo");
 const addTransitPortBtn = document.getElementById("addTransitPortBtn");
@@ -2324,6 +2375,8 @@ async function autoComputeSunriseSetForCurrent(){
   if (!p) return;
 
   const date = (p.plan.date || planDate?.value || "").trim();
+  const timeZone = normalisePassageTimeZone(planTimeZone?.value || p.plan.timeZone);
+  p.plan.timeZone = timeZone;
   const from = (p.plan.from || planFrom?.value || "").trim();
   const to   = (p.plan.to   || planTo?.value || "").trim();
 
@@ -2338,12 +2391,12 @@ async function autoComputeSunriseSetForCurrent(){
 
   if (!origin) return;
 
-  const sunOrigin = calcSunTimes(date, origin.lat, origin.lon);
+  const sunOrigin = calcSunTimes(date, origin.lat, origin.lon, timeZone);
   if (!sunOrigin) return;
 
   let sunset = sunOrigin.sunset;
   if (dest && dest !== origin){
-    const sunDest = calcSunTimes(date, dest.lat, dest.lon);
+    const sunDest = calcSunTimes(date, dest.lat, dest.lon, timeZone);
     if (sunDest && sunDest.sunset) sunset = sunDest.sunset;
   }
 
@@ -2363,9 +2416,9 @@ async function autoComputeSunriseSetForCurrent(){
       if (moonDest?.set) moonSet = moonDest.set;
     }
 
-    const riseStr = moonRise ? formatTimeEuropeLondon(moonRise)
+    const riseStr = moonRise ? formatTimeInZone(moonRise, timeZone)
       : (moonOrigin?.alwaysUp ? "Always up" : (moonOrigin?.alwaysDown ? "Always down" : ""));
-    const setStr  = moonSet ? formatTimeEuropeLondon(moonSet) : "";
+    const setStr  = moonSet ? formatTimeInZone(moonSet, timeZone) : "";
 
     const moonVal = (riseStr || setStr) ? `${riseStr || "—"} / ${setStr || "—"}` : "";
     p.plan.moonRiseSet = moonVal;
@@ -2801,6 +2854,109 @@ function deletePassageById(id) {
   loadPassageIntoUI();
 }
 
+function cloneJsonSafe(value, fallback) {
+  try {
+    return JSON.parse(JSON.stringify(value == null ? fallback : value));
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function clonePassagePlanForCopy(plan) {
+  const source = plan && typeof plan === "object" ? plan : {};
+  const copy = cloneJsonSafe(source, {});
+  const now = Date.now();
+
+  copy.transitPorts = Array.isArray(copy.transitPorts)
+    ? copy.transitPorts.map(t => t && typeof t === "object"
+      ? { ...t, name: String(t.name || "").trim(), portId: t.portId ? String(t.portId) : "" }
+      : { name: String(t || "").trim(), portId: "" })
+    : [];
+
+  copy.tideStations = Array.isArray(copy.tideStations)
+    ? copy.tideStations.map((st, idx) => ({
+      ...st,
+      id: `ts_${now}_${idx}_${Math.random().toString(36).slice(2)}`,
+      events: Array.isArray(st?.events) ? cloneJsonSafe(st.events, []) : []
+    }))
+    : [];
+
+  copy.dailySummaries = Array.isArray(copy.dailySummaries)
+    ? copy.dailySummaries.map((day, idx) => ({
+      ...day,
+      id: `ds_${now}_${idx}_${Math.random().toString(36).slice(2)}`
+    }))
+    : [];
+
+  if (typeof cloneDetailedPassagePlan === "function") {
+    copy.detailed = cloneDetailedPassagePlan(copy.detailed, { regenerateIds: true });
+    copy.detailedLegs = Array.isArray(copy.detailedLegs)
+      ? copy.detailedLegs.map(d => cloneDetailedPassagePlan(d, { regenerateIds: true }))
+      : [];
+  } else {
+    copy.detailed = cloneJsonSafe(copy.detailed, { waypoints: [], hazards: "", portsOfRefuge: "", crewWelfare: "" });
+    copy.detailedLegs = Array.isArray(copy.detailedLegs) ? cloneJsonSafe(copy.detailedLegs, []) : [];
+  }
+  copy.detailedLegIndex = 0;
+
+  return {
+    ...copy,
+    date: copy.date || passageDateToday({ plan: { timeZone: copy.timeZone } }),
+    timeZone: normalisePassageTimeZone(copy.timeZone),
+    from: copy.from || "",
+    to: copy.to || "",
+    transitPorts: copy.transitPorts,
+    vessel: copy.vessel || "STEELER",
+    skipper: copy.skipper || "",
+    crew: copy.crew || "",
+    sunriseSet: copy.sunriseSet || "",
+    moonPhase: copy.moonPhase || "",
+    moonRiseSet: copy.moonRiseSet || "",
+    tidalCoeff: copy.tidalCoeff || "",
+    tideStations: copy.tideStations,
+    currents: copy.currents || "",
+    weather: copy.weather || "",
+    comms: copy.comms || "",
+    engineHoursStart: copy.engineHoursStart || "",
+    fuelStartPercent: copy.fuelStartPercent || "",
+    dailySummaries: copy.dailySummaries,
+    detailed: copy.detailed || { waypoints: [], hazards: "", portsOfRefuge: "", crewWelfare: "" },
+    detailedLegs: copy.detailedLegs,
+    detailedLegIndex: copy.detailedLegIndex
+  };
+}
+
+function copyPassagePlanById(id) {
+  const source = passages.find(p => p.id === id);
+  if (!source || !source.plan) return;
+  const route = getRouteNames(source).join(" → ") || "this passage";
+  const ok = confirm(`Copy the passage plan for ${route}?\n\nA new planned passage will be created with the same plan details, ready to edit. Log entries and completion state will not be copied.`);
+  if (!ok) return;
+
+  const copied = {
+    id: newId("p"),
+    flags: { engineStart: false, slip: false, dock: false },
+    plan: clonePassagePlanForCopy(source.plan),
+    entries: [],
+    finish: {
+      engineHoursEnd: "",
+      fuelEndPercent: "",
+      notes: "",
+      shutdownLogged: false
+    },
+    createdAt: new Date().toISOString()
+  };
+
+  ensureAutoTideStations(copied);
+  ensureDetailedPassagePlans(copied);
+  passages.unshift(copied);
+  currentPassageId = copied.id;
+  savePassages();
+  refreshHomePassageList();
+  loadPassageIntoUI();
+  switchToTab("planTab");
+}
+
 function attachSwipeToCard(card, passageId) {
   let startX = 0;
   let startY = 0;
@@ -2808,8 +2964,8 @@ function attachSwipeToCard(card, passageId) {
   let isHorizontalSwipe = false;
   let wheelX = 0;
   let wheelTimer = null;
-  const revealPx = 76;
-  const lockThresholdPx = 76;
+  const revealPx = 92;
+  const lockThresholdPx = 84;
   const commitThresholdPx = 220;
 
   const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
@@ -2975,8 +3131,17 @@ function getPassageStatusClass(status) {
     .replace(/^-|-$/g, "");
 }
 
+function selectHomePassage(passage, { openLog = false } = {}) {
+  if (!passage) return;
+  currentPassageId = passage.id;
+  loadPassageIntoUI();
+  refreshHomePassageList();
+  if (openLog) switchToTab("logTab");
+}
+
 function refreshHomePassageList() {
   homePassageList.innerHTML = "";
+  if (homeCopyPassageBtn) homeCopyPassageBtn.disabled = !currentPassageId || !passages.some(p => p.id === currentPassageId);
 
   if (passages.length === 0) {
     const p = document.createElement("p");
@@ -3032,6 +3197,14 @@ function refreshHomePassageList() {
     const chevron = document.createElement("div");
     chevron.className = "passage-card-chevron";
     chevron.textContent = ">";
+    chevron.title = "Open log";
+    chevron.setAttribute("role", "button");
+    chevron.setAttribute("aria-label", "Open log");
+    chevron.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      selectHomePassage(passage, { openLog: true });
+    });
 
     const main = document.createElement("div");
     main.className = "passage-card-main";
@@ -3042,10 +3215,23 @@ function refreshHomePassageList() {
     const actions = document.createElement("div");
     actions.className = "passage-card-actions";
 
+    const copy = document.createElement("button");
+    copy.className = "passage-copy-btn";
+    copy.innerHTML = copySvg();
+    copy.title = "Copy passage plan";
+    copy.setAttribute("aria-label", "Copy passage plan");
+
+    copy.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      copyPassagePlanById(passage.id);
+    });
+
     const del = document.createElement("button");
     del.className = "passage-delete-btn";
     del.innerHTML = deleteBinSvg();
-				del.title = "Delete passage";
+    del.title = "Delete passage";
+    del.setAttribute("aria-label", "Delete passage");
     
     del.addEventListener("click", (e) => {
       e.preventDefault();
@@ -3053,18 +3239,41 @@ function refreshHomePassageList() {
       deletePassageById(passage.id);
     });
 
+    actions.appendChild(copy);
     actions.appendChild(del);
     card.appendChild(main);
     card.appendChild(actions);
 
+    let homeCardLongPressTimer = null;
+    const clearHomeCardLongPress = () => {
+      clearTimeout(homeCardLongPressTimer);
+      homeCardLongPressTimer = null;
+    };
+
+    card.addEventListener("pointerdown", (e) => {
+      if (e.target.closest(".passage-copy-btn, .passage-delete-btn")) return;
+      clearHomeCardLongPress();
+      homeCardLongPressTimer = setTimeout(() => {
+        card.dataset.openedByLongPress = "1";
+        selectHomePassage(passage, { openLog: true });
+        setTimeout(() => { delete card.dataset.openedByLongPress; }, 450);
+      }, 650);
+    });
+    card.addEventListener("pointerup", clearHomeCardLongPress);
+    card.addEventListener("pointerleave", clearHomeCardLongPress);
+    card.addEventListener("pointercancel", clearHomeCardLongPress);
+    card.addEventListener("dblclick", (e) => {
+      if (e.target.closest(".passage-copy-btn, .passage-delete-btn")) return;
+      e.preventDefault();
+      e.stopPropagation();
+      selectHomePassage(passage, { openLog: true });
+    });
+
     card.addEventListener("click", (e) => {
       if (card.dataset.justSwiped === "1") return;
-      if (e.target.closest(".passage-delete-btn")) return;
-
-      currentPassageId = passage.id;
-      loadPassageIntoUI();
-      refreshHomePassageList();
-      switchToTab("logTab");
+      if (card.dataset.openedByLongPress === "1") return;
+      if (e.target.closest(".passage-copy-btn, .passage-delete-btn")) return;
+      selectHomePassage(passage, { openLog: false });
     });
 
     attachSwipeToCard(card, passage.id);
@@ -3551,13 +3760,15 @@ function removeTransitPortAt(index){
 
 function createPassage() {
   const id = "p_" + Date.now();
-  const today = new Date().toISOString().slice(0, 10);
+  const deviceTimeZone = getDevicePassageTimeZone();
+  const today = passageDateToday({ plan: { timeZone: deviceTimeZone } });
 
   const passage = {
     id,
     flags: { engineStart: false, slip: false, dock: false },
     plan: {
       date: today,
+      timeZone: deviceTimeZone,
       from: "",
       to: "",
       transitPorts: [],
@@ -3604,7 +3815,9 @@ function createPassage() {
 }
 
 function loadPlanIntoForm(p) {
+  p.plan.timeZone = getPassageTimeZone(p);
   planDate.value = p.plan.date || "";
+  if (planTimeZone) planTimeZone.value = p.plan.timeZone;
   planFrom.value = p.plan.from || "";
   planTo.value   = p.plan.to   || "";
   try{ setWeatherStatus(""); }catch{}
@@ -5300,6 +5513,7 @@ function scheduleAutoSunSync(){
     const p = getCurrentPassage();
     if (!p) return;
     p.plan.date = planDate.value;
+    p.plan.timeZone = normalisePassageTimeZone(planTimeZone?.value || p.plan.timeZone);
     p.plan.from = planFrom.value.trim();
     p.plan.to   = planTo.value.trim();
     autoComputeSunriseSetForCurrent();
@@ -5312,6 +5526,7 @@ function scheduleAutoSunSync(){
   }, 180);
 }
 planDate.addEventListener("input", scheduleAutoSunSync);
+planTimeZone?.addEventListener("change", scheduleAutoSunSync);
 planFrom.addEventListener("input", scheduleAutoSunSync);
 planFrom.addEventListener("input", updatePlanCommsFromPorts);
 planTo.addEventListener("input", updatePlanCommsFromPorts);
@@ -5843,6 +6058,7 @@ planForm.addEventListener("submit", async (e) => {
   if (!p) return;
 
   p.plan.date = planDate.value;
+  p.plan.timeZone = normalisePassageTimeZone(planTimeZone?.value || p.plan.timeZone);
   p.plan.from = planFrom.value.trim();
   p.plan.to   = planTo.value.trim();
 
@@ -5954,6 +6170,7 @@ function updatePlanSummaryPanel() {
 		recalcDetailedPassagePlan(p, getSelectedDetailedPlanLegIndex(p));
 
   const sunriseSet = p.plan.sunriseSet || "";
+  const timeZoneLabel = getPassageTimeZoneLabel(p);
   const moonPhase = normaliseMoonPhaseLabel(p.plan.moonPhase || "");
   const moonRiseSet = p.plan.moonRiseSet || "";
   const tidalCoeff = p.plan.tidalCoeff || "";
@@ -6068,6 +6285,7 @@ function updatePlanSummaryPanel() {
       <div class="col plan-summary-col plan-summary-col-right">
         <div class="block plan-link" data-goto="planSunriseSet">
           <p class="section-title">SUN &amp; MOON</p>
+          <p><strong>Time zone:</strong> ${escapeHtml(timeZoneLabel)}</p>
           <p><strong>Sunrise / Sunset:</strong> ${sunriseSet ? escapeHtml(sunriseSet) : "–"}</p>
           <p><strong>Moon phase:</strong> ${moonPhase ? `<span class="moon-phase-display">${escapeHtml(moonPhase)}</span>` : "–"}</p>
           <p><strong>Moon rise / set:</strong> ${moonRiseSet ? escapeHtml(moonRiseSet) : "–"}</p>
@@ -6739,7 +6957,7 @@ async function openEngineStartEntryDialog(p, legIdx, entry = null) {
               <div class="engine-start-row engine-start-values st-modal-section">
                 <label class="entry-dialog-field">
                   <span>Time</span>
-                  <input id="esTime" type="text" inputmode="numeric" value="${escapeHtml(entry?.time ? timeOnlyFromIso(entry.time) : timeOnlyFromIso(localDateTimeInputValue(new Date())))}">
+                  <input id="esTime" type="text" inputmode="numeric" value="${escapeHtml(entry?.time ? timeOnlyFromIso(entry.time) : timeOnlyFromIso(passageDateTimeNow(p)))}">
                 </label>
 
                 <label class="entry-dialog-field">
@@ -6946,7 +7164,7 @@ async function openShutdownEntryDialog(p, legIdx, isFinalLeg, entry = null) {
       bodyHtml: `
         <div class="st-task-sheet shutdown-sheet entry-dialog-grid entry-dialog-grid-two">
           ${dialogSection('Shutdown values',
-            dialogField('Time', 'shTime', entry?.time ? timeOnlyFromIso(entry.time) : timeOnlyFromIso(localDateTimeInputValue(new Date())), { inputMode: 'numeric' }) +
+            dialogField('Time', 'shTime', entry?.time ? timeOnlyFromIso(entry.time) : timeOnlyFromIso(passageDateTimeNow(p)), { inputMode: 'numeric' }) +
             dialogField('Fuel %(R)', 'shFuelR', prev.fuelEndPercentR || prev.fuelEndPercent || '', { type: 'number', inputMode: 'numeric', step: '1' }) +
             dialogField('Fuel %(C)', 'shFuelC', prev.fuelEndPercentC || '', { type: 'number', inputMode: 'numeric', step: '1' }) +
             dialogField('Engine hours (end)', 'shEh', prev.engineHoursEnd || '', { type: 'number', inputMode: 'decimal', step: '0.1' })
@@ -7053,7 +7271,7 @@ function addSpecialEntry(noteText, notesOverride = null) {
   if (passageIsShutdown(p)) return alert("Shutdown already recorded – no further log entries allowed.");
 
   const now = new Date();
-  const timeStr = localDateTimeInputValue(now);
+  const timeStr = localDateTimeInputValue(now, getPassageTimeZone(p));
 
   const entry = {
     id: "e_" + Date.now(),
@@ -7281,7 +7499,7 @@ async function addWaypointReachedEntry(p){
   }
 
   return await new Promise((resolve) => {
-    const nowIso = localDateTimeInputValue(new Date());
+    const nowIso = passageDateTimeNow(p);
     const optionHtml = options
       .map(({ wp, waypointIndex }) => {
         const labelBits = [wp.name || `Waypoint ${waypointIndex + 1}`];
@@ -7372,7 +7590,7 @@ async function addLogEntry(){
 
   const entry = {
     id: newId('e'),
-    time: localDateTimeInputValue(new Date()),
+    time: passageDateTimeNow(p),
     leg: getCurrentLegIndex(p),
     course: "",
     speed: "",
@@ -7407,7 +7625,7 @@ function addDockEntry() {
   if (passageIsShutdown(p)) return alert("Shutdown already recorded – no further log entries allowed.");
 
   const now = new Date();
-  const timeStr = localDateTimeInputValue(now);
+  const timeStr = localDateTimeInputValue(now, getPassageTimeZone(p));
 
   const entry = {
     id: "e_" + Date.now(),
@@ -7437,6 +7655,15 @@ function deleteBinSvg(){
     <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
       <path fill="currentColor" d="M8 4h8l.8 2H21v2H3V6h4.2L8 4z"/>
       <path fill="currentColor" d="M6 9h12l-1 11H7L6 9zm3 2v7h2v-7H9zm4 0v7h2v-7h-2z"/>
+    </svg>
+  `;
+}
+
+function copySvg(){
+  return `
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+      <path fill="currentColor" d="M8 7h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2zm0 2v10h10V9H8z"/>
+      <path fill="currentColor" d="M4 3h10v2H5v9H3V5a2 2 0 0 1 2-2z"/>
     </svg>
   `;
 }
@@ -8108,6 +8335,15 @@ homeNewPassageBtn.addEventListener("click", () => {
   }
   createPassage();
   switchToTab("planTab");
+});
+
+homeCopyPassageBtn?.addEventListener("click", () => {
+  const p = getCurrentPassage();
+  if (!p) {
+    alert("Select a passage to copy first.");
+    return;
+  }
+  copyPassagePlanById(p.id);
 });
 
 homePassageSearch?.addEventListener("input", refreshHomePassageList);
