@@ -12,7 +12,7 @@ const SYNC_STATUS_KEY = "steeler_sync_status_v1";
 const SYNC_CONFIG_KEY = "steeler_sync_config_v1";
 const SYNC_RECORD_META_KEY = "steeler_sync_record_meta_v1";
 
-const APP_VERSION = "1.2.0";
+const APP_VERSION = "1.2.1";
 const LOCAL_DATA_SCHEMA_VERSION = 1;
 const DATA_BACKUP_FORMAT = "steeler-data-backup";
 const DEFAULT_SYNC_WORKER_URL = "https://steeler-logbook-sync.bill-merry-52f.workers.dev";
@@ -3239,6 +3239,12 @@ function markPassageDirty(p, timestamp = nowIso(), reason = "passage-change"){
   recordLocalSyncChange(reason, timestamp);
 }
 
+function markPassageDirtyIfPlanChanged(p, beforePlanJson, reason = "plan-change"){
+  if (!p || typeof p !== "object") return;
+  const afterPlanJson = stableComparableJson(p.plan || {});
+  if (afterPlanJson !== beforePlanJson) markPassageDirty(p, nowIso(), reason);
+}
+
 function markLogEntryDirty(entry, p, options = {}){
   if (!entry || typeof entry !== "object") return;
   const timestamp = options.at || nowIso();
@@ -3740,6 +3746,7 @@ function switchToTab(tabId) {
     if (planWasActive && tabId !== "planTab") {
       const p = getCurrentPassage();
       if (p && p.plan) {
+        const beforePlanJson = stableComparableJson(p.plan || {});
         if (typeof planSunriseSet !== "undefined" && planSunriseSet) p.plan.sunriseSet = planSunriseSet.value.trim();
         if (typeof planMoonPhase !== "undefined" && planMoonPhase) p.plan.moonPhase = normaliseMoonPhaseLabel(planMoonPhase.value);
         if (typeof planMoonRiseSet !== "undefined" && planMoonRiseSet) p.plan.moonRiseSet = planMoonRiseSet.value.trim();
@@ -3753,6 +3760,7 @@ function switchToTab(tabId) {
         }
         if (typeof readDailySummariesFromForm === "function") p.plan.dailySummaries = readDailySummariesFromForm();
         if (typeof readDetailedPassagePlanFromForm === "function") readDetailedPassagePlanFromForm();
+        markPassageDirtyIfPlanChanged(p, beforePlanJson, "plan-autosave");
         try { savePassages(); } catch {}
       }
     }
@@ -6071,8 +6079,10 @@ function __scheduleTideStationsAutosave(){
     try {
       const p = getCurrentPassage();
       if (!p || !p.plan) return;
+      const beforePlanJson = stableComparableJson(p.plan || {});
       p.plan.tideStations = readTideStationsFromForm();
       try { ensureAutoTideStations(p); } catch {}
+      markPassageDirtyIfPlanChanged(p, beforePlanJson, "plan-tides-change");
       try { savePassages(); } catch {}
       // If Log tab is visible, refresh the left Plan summary panel immediately.
       try {
@@ -6143,8 +6153,10 @@ function renderDailySummaries(p) {
   const days = p.plan.dailySummaries || [];
   days.forEach((d, index) => {
     const row = document.createElement("div");
+    const dayId = d.id || ("ds_" + Date.now() + "_" + Math.random().toString(36).slice(2));
     row.className = "daily-summary-row";
     row.dataset.index = index;
+    row.dataset.id = dayId;
 
     row.innerHTML = `
       <div class="row ds-row">
@@ -6181,7 +6193,7 @@ function readDailySummariesFromForm() {
   const rows = dailySummariesContainer.querySelectorAll(".daily-summary-row");
   rows.forEach(row => {
     days.push({
-      id: "ds_" + Date.now() + "_" + Math.random().toString(36).slice(2),
+      id: row.dataset.id || ("ds_" + Date.now() + "_" + Math.random().toString(36).slice(2)),
       date: row.querySelector(".ds-date").value,
       fee: row.querySelector(".ds-fee").value.trim(),
       notes: row.querySelector(".ds-notes").value.trim()
@@ -7922,8 +7934,10 @@ function applyWeatherSection(sectionKey, titleLine, content, meta){
 
   const p = getCurrentPassage();
   if(p){
+    const beforePlanJson = stableComparableJson(p.plan || {});
     p.plan = p.plan || {};
     p.plan.weather = merged;
+    markPassageDirtyIfPlanChanged(p, beforePlanJson, "plan-weather-change");
     savePassages();
   }
 }
@@ -8111,8 +8125,10 @@ const byProvider = { metoffice: [], meteofrance: [] };
 
     const pp = getCurrentPassage();
     if (pp){
+      const beforePlanJson = stableComparableJson(pp.plan || {});
       if (!pp.plan) pp.plan = {};
       pp.plan.weather = merged;
+      markPassageDirtyIfPlanChanged(pp, beforePlanJson, "plan-weather-change");
       savePassages();
     }
 
@@ -8142,6 +8158,7 @@ planForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const p = getCurrentPassage();
   if (!p) return;
+  const beforePlanJson = stableComparableJson(p.plan || {});
 
   p.plan.date = planDate.value;
   p.plan.timeZone = normalisePassageTimeZone(planTimeZone?.value || p.plan.timeZone);
@@ -8224,6 +8241,7 @@ p.plan.vessel = planVessel.value.trim();
     console.warn("Port confirmation flow failed", e);
   }
 
+  markPassageDirtyIfPlanChanged(p, beforePlanJson, "plan-change");
   savePassages();
 
   // If ports already exist, update MRU.

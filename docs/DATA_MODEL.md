@@ -1,6 +1,6 @@
 # STEELER Logbook Data Model
 
-This document records the local data shapes used by the v1.2.0 sync-foundation build. It began as the v0.11.5 baseline documentation and has been updated as the architecture foundation work added safety mirrors, modules, v0.20.x sea-use tweaks, reusable Detailed Passage Plan templates, and the first offline-first sync preparation fields.
+This document records the local data shapes used by the v1.2.1 sync-foundation build. It began as the v0.11.5 baseline documentation and has been updated as the architecture foundation work added safety mirrors, modules, v0.20.x sea-use tweaks, reusable Detailed Passage Plan templates, and the first offline-first sync preparation fields.
 
 The app is an offline-first browser PWA. User data is stored in `localStorage` as JSON strings, except for the theme value. Storage keys and data shapes must not be changed without an explicit migration plan and backup/restore testing.
 
@@ -307,7 +307,7 @@ Stored separately from passages in `steeler_dpp_waypoints_v1`.
 
 Manual log entries are the source of truth. Future live/NMEA values may prefill dialogs, but should not replace saved manual entries.
 
-Deleted log entries are soft-deleted for v1.2.0 sync safety. The app hides entries where `deleted === true` from normal log views, counts, summaries, CSV export and PDF/print export, but keeps them in `steeler_logbook_passages_v5` and full data backups. This lets a later sync stage distinguish "deleted intentionally" from "missing because this device is old".
+Deleted log entries are soft-deleted for v1.2.1 sync safety. The app hides entries where `deleted === true` from normal log views, counts, summaries, CSV export and PDF/print export, but keeps them in `steeler_logbook_passages_v5` and full data backups. This lets a later sync stage distinguish "deleted intentionally" from "missing because this device is old".
 
 `syncDirty`, `syncStatus`, and `dirtyAt` are local sync-preparation fields. They mark records that have changed locally and need future sync processing. They do not currently contact a server.
 
@@ -507,7 +507,7 @@ Primary full data backup:
   version: 1,
   schemaVersion: 1,
   exportedAt: "2026-05-03T12:00:00.000Z",
-  appVersion: "1.2.0-rc5",
+  appVersion: "1.2.1",
   exportedByDeviceId: "device_...",
   data: {
     passages: Passage[],
@@ -539,7 +539,7 @@ Primary full data backup:
 }
 ```
 
-The primary data backup is the preferred v1.2.0 archive/restore format. It includes all local STEELER data needed for a full-device restore. `localSyncStatus` is included for diagnostics, but restore does not replace the destination device's `steeler_device_id_v1` or use the backup's sync status as a cloud authority.
+The primary data backup is the preferred v1.2.1 archive/restore format. It includes all local STEELER data needed for a full-device restore. `localSyncStatus` is included for diagnostics, but restore does not replace the destination device's `steeler_device_id_v1` or use the backup's sync status as a cloud authority.
 
 When the manual Settings action sends a cloud backup, the app wraps this same payload in a sync Worker record:
 
@@ -550,7 +550,7 @@ When the manual Settings action sends a cloud backup, the app wraps this same pa
     format: "steeler-cloud-backup-record",
     version: 1,
     createdAt: "2026-05-03T12:00:00.000Z",
-    appVersion: "1.2.0",
+    appVersion: "1.2.1",
     deviceId: "device_...",
     backup: SteelerDataBackup
   }
@@ -565,7 +565,7 @@ The read-only cloud backup list is returned by `/v1/backups` and contains summar
 {
   recordId: "cloud_backup_...",
   createdAt: "2026-05-03T12:00:00.000Z",
-  appVersion: "1.2.0",
+  appVersion: "1.2.1",
   deviceId: "device_...",
   passageCount: 4,
   serverUpdatedAt: "2026-05-03 12:00:01",
@@ -584,7 +584,7 @@ The selected cloud backup download is returned by `/v1/backups/{recordId}`:
   backup: SteelerDataBackup,
   summary: {
     createdAt: "2026-05-03T12:00:00.000Z",
-    appVersion: "1.2.0",
+    appVersion: "1.2.1",
     deviceId: "device_...",
     serverUpdatedAt: "2026-05-03 12:00:01",
     serverRevision: 12
@@ -609,7 +609,7 @@ Manual Sync Preview builds local sync records, but does not upload or apply them
   payload: {
     format: "steeler-sync-record",
     version: 1,
-    appVersion: "1.2.0",
+    appVersion: "1.2.1",
     recordType: "passage",
     updatedAt: "2026-05-03T12:00:00.000Z",
     data: Passage

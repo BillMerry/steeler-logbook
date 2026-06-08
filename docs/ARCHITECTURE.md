@@ -1,6 +1,6 @@
 # STEELER Logbook Architecture
 
-This document records the v1.2.0 sync-foundation architecture, including the v0.20.x sea-use tweaks, Detailed Passage Plan template management, and the first offline-first data sync groundwork.
+This document records the v1.2.1 sync-foundation architecture, including the v0.20.x sea-use tweaks, Detailed Passage Plan template management, and the first offline-first data sync groundwork.
 
 STEELER Logbook is a vanilla HTML/CSS/JavaScript offline-first PWA intended for iPad use at sea. Reliability, predictable offline behaviour and preservation of existing passage data are more important than reducing file size or changing code shape for its own sake.
 
@@ -32,7 +32,7 @@ Modules should provide focused helpers for calculations, parsing, rendering or d
 
 ## Sync Worker Prototype
 
-`sync-worker/` contains an isolated Cloudflare Worker + D1 prototype for the v1.2.0 sync stream. The browser app can now call it manually from Settings for manual sync checks, manual sync preview, manual sync-record upload, receive-only sync-record apply, one-way backup uploads, read-only backup listing, backup JSON download, and guarded cloud-backup restore.
+`sync-worker/` contains an isolated Cloudflare Worker + D1 prototype for the v1.2.1 sync stream. The browser app can now call it manually from Settings for manual sync checks, manual sync preview, manual sync-record upload, receive-only sync-record apply, one-way backup uploads, read-only backup listing, backup JSON download, and guarded cloud-backup restore.
 
 The prototype uses:
 
@@ -50,7 +50,7 @@ It remains deliberately conservative until broader multi-device safety testing i
 - Safety mirrors/last-known-good keys are separate safety keys and must not replace the canonical data keys.
 - Parse failures should be visible and recoverable, with a route to export raw corrupted data before reset or recovery.
 - Backup/restore format changes must be backward compatible.
-- The primary v1.2.0 backup format is `steeler-data-backup`, which archives all local STEELER data on the device. Older logbook, ports, and DPP backup formats remain readable where supported.
+- The primary v1.2.1 backup format is `steeler-data-backup`, which archives all local STEELER data on the device. Older logbook, ports, and DPP backup formats remain readable where supported.
 - A local `steeler_device_id_v1` value identifies this browser/device for future sync. It is created locally and must not be replaced by restoring a data backup.
 - Passage and log-entry deletion is recoverable: deleted records stay in local passage data with `deleted: true`, but are hidden from normal operational views and exports.
 - `steeler_sync_status_v1` stores local sync preparation status, including pending local change counts, last local change time, Worker check results, and the last one-way cloud backup result.
