@@ -1,6 +1,6 @@
 # STEELER Logbook Architecture
 
-This document records the v1.0.1 architecture foundation, including the v0.20.x sea-use tweaks and Detailed Passage Plan template management.
+This document records the v1.2.0 sync-foundation architecture, including the v0.20.x sea-use tweaks, Detailed Passage Plan template management, and the first offline-first data sync groundwork.
 
 STEELER Logbook is a vanilla HTML/CSS/JavaScript offline-first PWA intended for iPad use at sea. Reliability, predictable offline behaviour and preservation of existing passage data are more important than reducing file size or changing code shape for its own sake.
 
@@ -30,6 +30,19 @@ Modules should provide focused helpers for calculations, parsing, rendering or d
 - `js/safety-emergency.js`: Safety/Emergency data defaults, storage access, contact normalization and legacy EC migration.
 - `js/live-data.js`: no-op future boundary for liveData/NMEA integration.
 
+## Sync Worker Prototype
+
+`sync-worker/` contains an isolated Cloudflare Worker + D1 prototype for the v1.2.0 sync stream. The browser app can now call it manually from Settings for manual sync checks, manual sync preview, manual sync-record upload, receive-only sync-record apply, one-way backup uploads, read-only backup listing, backup JSON download, and guarded cloud-backup restore.
+
+The prototype uses:
+
+- A small token-protected JSON API.
+- D1 as the structured sync record store.
+- Record payloads stored as JSON plus indexed metadata.
+- Server revisions for future pull-by-change workflows.
+
+It remains deliberately conservative until broader multi-device safety testing is ready. The current browser connection can build a local sync-record preview, ask the Worker for remote sync-record summaries, manually upload safe local sync records, receive and apply safe previewed cloud sync records, send a complete cloud backup record, list recent cloud backup summaries, download a selected backup JSON file, and manually restore a selected cloud backup after confirmations and a local safety-backup download. It does not yet run automatic background sync.
+
 ## Storage And Data Safety Rules
 
 - Existing localStorage keys and data shapes must not change without an explicit migration plan.
@@ -37,6 +50,20 @@ Modules should provide focused helpers for calculations, parsing, rendering or d
 - Safety mirrors/last-known-good keys are separate safety keys and must not replace the canonical data keys.
 - Parse failures should be visible and recoverable, with a route to export raw corrupted data before reset or recovery.
 - Backup/restore format changes must be backward compatible.
+- The primary v1.2.0 backup format is `steeler-data-backup`, which archives all local STEELER data on the device. Older logbook, ports, and DPP backup formats remain readable where supported.
+- A local `steeler_device_id_v1` value identifies this browser/device for future sync. It is created locally and must not be replaced by restoring a data backup.
+- Passage and log-entry deletion is recoverable: deleted records stay in local passage data with `deleted: true`, but are hidden from normal operational views and exports.
+- `steeler_sync_status_v1` stores local sync preparation status, including pending local change counts, last local change time, Worker check results, and the last one-way cloud backup result.
+- `steeler_sync_config_v1` stores the sync Worker URL and token locally so Settings can test `/v1/status`, preview sync, send sync records, receive sync records, send a one-way cloud backup, list recent cloud backup summaries, download a selected backup JSON file, and manually restore a selected cloud backup. The token is not included in full data backups.
+- Manual Sync Preview builds local `steeler-sync-record` payloads for passages, ports, Safety/Emergency, legacy emergency-contact settings, DPP templates, DPP waypoints, weather abbreviations, fuel settings, and app settings. It compares them with `/v1/records/summary` and does not upload or apply records.
+- Preview Sync separates records into safe to send, safe to receive, and needs review. A record needs review when local and cloud versions both exist, differ, and appear to have been last changed by different devices.
+- Preview details include lightweight summaries for shared global records, including Ports, Safety Info, DPP templates, DPP waypoints, weather abbreviations, fuel settings, and app settings.
+- Needs-review records can be resolved one at a time by keeping this device's version or using the cloud version. Keeping this device sends only that one local record to Cloudflare. Using cloud downloads a local safety backup first, then applies only that one cloud record.
+- Full Sync sends records marked safe to send, receives records marked safe to receive, downloads a local safety backup before receiving anything, refreshes the preview when finished, and leaves needs-review records untouched.
+- The main sync UI shows Preview Sync and Full Sync first. Advanced sync tools expose one-way send/receive, Worker check, and cloud backup controls.
+- Send Sync Records sends only the records that Preview Sync marks as safe to send via `/v1/records/push`. After every selected record is accepted, local sync-dirty flags are cleared. Records needing review are left untouched. It does not receive, merge, restore, or overwrite local data.
+- Receive Sync Records fetches only the cloud records that Preview Sync marks as safe to receive. It downloads a local safety backup first, warns if this device also has local records waiting to upload, and applies only the selected received records. Records needing review are left untouched. It does not send local records.
+- The manual cloud backup uses `/v1/records/push` with record type `cloud-backup`. The read-only backup list uses `/v1/backups`; selected backup download/restore uses `/v1/backups/{recordId}`. Restore first downloads a local safety backup and requires two confirmations. These workflows do not pull or merge sync records into the app.
 
 ## Service Worker Release Rules
 
@@ -46,7 +73,7 @@ For every release that changes cached files:
 - Update `CACHE_NAME` in `service-worker.js`.
 - Add any new cached assets to the `ASSETS` list.
 - Confirm app shell assets, every `js/*.js` module loaded by `index.html`, `styles.css`, `manifest.json`, icons, favicon and `STEELER-safety-emergency-details.html` are covered when they are part of the shipped app.
-- Confirm the staging URL shows the new version after refresh/update.
+- Confirm the live URL shows the new version after refresh/update.
 - Test offline launch after the update has installed.
 
 The service worker should remain conservative. Do not change cache strategy unless there is a clear reliability issue.

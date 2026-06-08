@@ -7,8 +7,15 @@ const DPP_TEMPLATES_KEY = "steeler_dpp_templates_v1";
 const DPP_WAYPOINTS_KEY = "steeler_dpp_waypoints_v1";
 const FUEL_MANAGEMENT_KEY = "steeler_fuel_management_v1";
 const LOG_SPLIT_RATIO_KEY = "steeler_log_split_ratio_v1";
+const DEVICE_ID_KEY = "steeler_device_id_v1";
+const SYNC_STATUS_KEY = "steeler_sync_status_v1";
+const SYNC_CONFIG_KEY = "steeler_sync_config_v1";
+const SYNC_RECORD_META_KEY = "steeler_sync_record_meta_v1";
 
-const APP_VERSION = "1.1.2";
+const APP_VERSION = "1.2.0";
+const LOCAL_DATA_SCHEMA_VERSION = 1;
+const DATA_BACKUP_FORMAT = "steeler-data-backup";
+const DEFAULT_SYNC_WORKER_URL = "https://steeler-logbook-sync.bill-merry-52f.workers.dev";
 const DEFAULT_PASSAGE_TIME_ZONE = "Europe/London";
 const PASSAGE_TIME_ZONES = {
   "Europe/London": "BST",
@@ -73,6 +80,1810 @@ const storage = {
     localStorage.removeItem(key);
   }
 };
+
+function nowIso(){
+  return new Date().toISOString();
+}
+
+function isValidIsoString(value){
+  if (!value || typeof value !== "string") return false;
+  const d = new Date(value);
+  return !Number.isNaN(d.getTime());
+}
+
+function makeStableId(prefix = "id"){
+  const safePrefix = String(prefix || "id").replace(/[^a-z0-9_-]/gi, "") || "id";
+  if (window.crypto && crypto.randomUUID) return `${safePrefix}_${crypto.randomUUID()}`;
+  return `${safePrefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getOrCreateDeviceId(){
+  let id = "";
+  try{
+    id = storage.getItem(DEVICE_ID_KEY) || "";
+    if (!id) {
+      id = makeStableId("device");
+      storage.setItem(DEVICE_ID_KEY, id);
+    }
+  }catch(e){
+    console.warn("Could not read or create device id", e);
+    id = id || makeStableId("device");
+  }
+  return id;
+}
+
+function loadSyncConfig(){
+  const fallback = {
+    version: 1,
+    workerUrl: DEFAULT_SYNC_WORKER_URL,
+    token: ""
+  };
+  const stored = loadLocalStorageJsonItem(
+    SYNC_CONFIG_KEY,
+    "sync config",
+    fallback,
+    value => value && typeof value === "object" && !Array.isArray(value)
+  );
+  return {
+    ...fallback,
+    ...stored,
+    version: 1,
+    workerUrl: String(stored?.workerUrl || fallback.workerUrl).trim(),
+    token: String(stored?.token || "")
+  };
+}
+
+function saveSyncConfig(config){
+  const clean = {
+    ...loadSyncConfig(),
+    ...(config || {}),
+    version: 1
+  };
+  clean.workerUrl = String(clean.workerUrl || DEFAULT_SYNC_WORKER_URL).trim().replace(/\/+$/g, "");
+  clean.token = String(clean.token || "");
+  storage.setItem(SYNC_CONFIG_KEY, JSON.stringify(clean));
+  return clean;
+}
+
+function loadLocalSyncStatus(){
+  const fallback = {
+    version: 1,
+    deviceId: getOrCreateDeviceId(),
+    syncEnabled: false,
+    status: "local-only",
+    lastLocalChangeAt: "",
+    lastSyncAt: "",
+    lastSyncError: "",
+    pendingLocalChanges: 0,
+    updatedAt: nowIso()
+  };
+  const stored = loadLocalStorageJsonItem(
+    SYNC_STATUS_KEY,
+    "sync status",
+    fallback,
+    value => value && typeof value === "object" && !Array.isArray(value)
+  );
+  return {
+    ...fallback,
+    ...stored,
+    version: 1,
+    deviceId: getOrCreateDeviceId(),
+    syncEnabled: false
+  };
+}
+
+function saveLocalSyncStatus(status){
+  try{
+    const clean = {
+      ...loadLocalSyncStatus(),
+      ...(status || {}),
+      version: 1,
+      deviceId: getOrCreateDeviceId(),
+      syncEnabled: false,
+      updatedAt: nowIso()
+    };
+    storage.setItem(SYNC_STATUS_KEY, JSON.stringify(clean));
+    return clean;
+  }catch(e){
+    console.warn("Could not save sync status", e);
+    return status || null;
+  }
+}
+
+function countPendingLocalChanges(){
+  let count = 0;
+  (Array.isArray(passages) ? passages : []).forEach((p) => {
+    if (p?.syncDirty) count += 1;
+    (Array.isArray(p?.entries) ? p.entries : []).forEach((entry) => {
+      if (entry?.syncDirty) count += 1;
+    });
+  });
+  (Array.isArray(knownPorts) ? knownPorts : []).forEach((port) => {
+    if (port?.syncDirty) count += 1;
+  });
+  return count;
+}
+
+function countRecoverableDeletedEntries(){
+  return (Array.isArray(passages) ? passages : []).reduce((sum, p) => {
+    return sum + (Array.isArray(p?.entries) ? p.entries.filter(isDeletedLogEntry).length : 0);
+  }, 0);
+}
+
+function isDeletedPassage(passage){
+  return !!(passage && passage.deleted === true);
+}
+
+function activePassages(){
+  return (Array.isArray(passages) ? passages : []).filter((passage) => !isDeletedPassage(passage));
+}
+
+function getFirstActivePassage(){
+  return activePassages()[0] || null;
+}
+
+function recordLocalSyncChange(reason = "local-change", timestamp = nowIso()){
+  if (reason === "ports-change") forgetSyncRecordMeta("global:ports");
+  const pending = countPendingLocalChanges();
+  saveLocalSyncStatus({
+    status: pending > 0 ? "local-pending" : "local-only",
+    lastLocalChangeAt: timestamp,
+    lastLocalChangeReason: reason,
+    pendingLocalChanges: pending
+  });
+  renderLocalSyncStatus();
+}
+
+function getLocalSyncSummary(){
+  const status = loadLocalSyncStatus();
+  const pending = countPendingLocalChanges();
+  const deleted = countRecoverableDeletedEntries();
+  if (status.pendingLocalChanges !== pending) {
+    status.pendingLocalChanges = pending;
+    status.status = pending > 0 ? "local-pending" : "local-only";
+    saveLocalSyncStatus(status);
+  }
+  return {
+    ...status,
+    pendingLocalChanges: pending,
+    recoverableDeletedEntries: deleted
+  };
+}
+
+function formatSyncStatusTime(value){
+  if (!isValidIsoString(value)) return "Never";
+  try{
+    return new Date(value).toLocaleString([], { dateStyle: "short", timeStyle: "short" });
+  }catch{
+    return value;
+  }
+}
+
+function renderLocalSyncStatus(){
+  const el = document.getElementById("syncStatusSummary");
+  if (!el) return;
+  const summary = getLocalSyncSummary();
+  const config = loadSyncConfig();
+  const shortDeviceId = String(summary.deviceId || "").slice(0, 18);
+  const lastCheck = summary.lastRemoteCheckAt || "";
+  const lastCloudBackup = summary.lastCloudBackupAt || "";
+  const remoteText = summary.lastRemoteStatus === "ok"
+    ? `OK${summary.lastRemoteRevision != null ? ` · rev ${summary.lastRemoteRevision}` : ""}`
+    : (summary.lastRemoteStatus === "error" ? "Error" : "Not checked");
+  el.innerHTML = `
+    <div class="sync-status-grid">
+      <div><span>Sync</span><strong>${escapeHtml(remoteText)}</strong></div>
+      <div><span>Pending local changes</span><strong>${summary.pendingLocalChanges}</strong></div>
+      <div><span>Recoverable deleted entries</span><strong>${summary.recoverableDeletedEntries}</strong></div>
+      <div><span>Last local change</span><strong>${escapeHtml(formatSyncStatusTime(summary.lastLocalChangeAt))}</strong></div>
+      <div><span>Last remote check</span><strong>${escapeHtml(formatSyncStatusTime(lastCheck))}</strong></div>
+      <div><span>Last cloud backup</span><strong>${escapeHtml(formatSyncStatusTime(lastCloudBackup))}</strong></div>
+      <div><span>Device ID</span><strong>${escapeHtml(shortDeviceId || "Creating...")}</strong></div>
+    </div>
+    <div class="sync-check-panel">
+      <label class="sync-check-field">
+        <span>Worker URL</span>
+        <input id="syncWorkerUrl" type="url" value="${escapeHtml(config.workerUrl)}" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="sync-check-field">
+        <span>Sync token</span>
+        <input id="syncWorkerToken" type="password" value="${escapeHtml(config.token)}" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="st-action-row">
+        <button type="button" id="syncPreviewBtn" class="btn btn-secondary">Preview Sync</button>
+        <button type="button" id="syncFullBtn" class="btn">Full Sync</button>
+      </div>
+      <details class="sync-advanced">
+        <summary>Advanced sync tools</summary>
+        <div class="st-action-row">
+          <button type="button" id="syncCheckStatusBtn" class="btn btn-secondary">Check Sync</button>
+          <button type="button" id="syncPushRecordsBtn" class="btn btn-secondary">Send Sync Records</button>
+          <button type="button" id="syncReceiveRecordsBtn" class="btn btn-secondary">Receive Sync Records</button>
+          <button type="button" id="syncSendBackupBtn" class="btn btn-secondary">Send Backup to Cloud</button>
+          <button type="button" id="syncRefreshBackupsBtn" class="btn btn-secondary">Refresh Cloud Backups</button>
+        </div>
+      </details>
+      <div id="syncPreviewResults" class="sync-preview-results">
+        <p class="hint">Preview Sync compares local data with cloud sync records. It does not upload, download, restore, merge or change data.</p>
+      </div>
+      <div id="syncCloudBackups" class="sync-cloud-backups">
+        <p class="hint">Refresh Cloud Backups shows recent backup copies stored in Cloudflare. It does not download, restore, merge or change local data.</p>
+      </div>
+      <p id="syncCheckMessage" class="hint">${escapeHtml(summary.lastSyncError || "Check Sync tests the Worker. Send Backup uploads one backup copy only; it does not pull, merge or overwrite local data.")}</p>
+    </div>
+  `;
+  bindSyncStatusControls();
+}
+
+function setSyncCheckMessage(message){
+  const el = document.getElementById("syncCheckMessage");
+  if (el) el.textContent = message || "";
+}
+
+function bindSyncStatusControls(){
+  const checkBtn = document.getElementById("syncCheckStatusBtn");
+  if (checkBtn && checkBtn.dataset.bound !== "1") {
+    checkBtn.dataset.bound = "1";
+    checkBtn.addEventListener("click", checkSyncWorkerStatus);
+  }
+
+  const backupBtn = document.getElementById("syncSendBackupBtn");
+  if (backupBtn && backupBtn.dataset.bound !== "1") {
+    backupBtn.dataset.bound = "1";
+    backupBtn.addEventListener("click", sendCloudBackup);
+  }
+
+  const refreshBtn = document.getElementById("syncRefreshBackupsBtn");
+  if (refreshBtn && refreshBtn.dataset.bound !== "1") {
+    refreshBtn.dataset.bound = "1";
+    refreshBtn.addEventListener("click", () => refreshCloudBackups());
+  }
+
+  const previewBtn = document.getElementById("syncPreviewBtn");
+  if (previewBtn && previewBtn.dataset.bound !== "1") {
+    previewBtn.dataset.bound = "1";
+    previewBtn.addEventListener("click", previewManualSync);
+  }
+
+  const fullBtn = document.getElementById("syncFullBtn");
+  if (fullBtn && fullBtn.dataset.bound !== "1") {
+    fullBtn.dataset.bound = "1";
+    fullBtn.addEventListener("click", fullManualSync);
+  }
+
+  const pushBtn = document.getElementById("syncPushRecordsBtn");
+  if (pushBtn && pushBtn.dataset.bound !== "1") {
+    pushBtn.dataset.bound = "1";
+    pushBtn.addEventListener("click", pushManualSyncRecords);
+  }
+
+  const receiveBtn = document.getElementById("syncReceiveRecordsBtn");
+  if (receiveBtn && receiveBtn.dataset.bound !== "1") {
+    receiveBtn.dataset.bound = "1";
+    receiveBtn.addEventListener("click", receiveManualSyncRecords);
+  }
+}
+
+function getSavedSyncConnection(){
+  const urlEl = document.getElementById("syncWorkerUrl");
+  const tokenEl = document.getElementById("syncWorkerToken");
+  const config = saveSyncConfig({
+    workerUrl: urlEl?.value || DEFAULT_SYNC_WORKER_URL,
+    token: tokenEl?.value || ""
+  });
+
+  if (!config.token) {
+    return { error: "Enter the sync token first." };
+  }
+
+  try{
+    const baseUrl = new URL(config.workerUrl);
+    return {
+      config,
+      baseUrl: baseUrl.toString().replace(/\/+$/g, "")
+    };
+  }catch{
+    return { error: "The Worker URL is not valid." };
+  }
+}
+
+async function checkSyncWorkerStatus(){
+  const btn = document.getElementById("syncCheckStatusBtn");
+  const connection = getSavedSyncConnection();
+  if (connection.error) {
+    setSyncCheckMessage(connection.error);
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  setSyncCheckMessage("Checking sync Worker...");
+  const checkedAt = nowIso();
+
+  try{
+    const res = await fetch(`${connection.baseUrl}/v1/status`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${connection.config.token}`
+      },
+      cache: "no-store"
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok !== true) {
+      throw new Error(data.error || `Worker returned ${res.status}`);
+    }
+
+    saveLocalSyncStatus({
+      status: "remote-check-ok",
+      lastRemoteStatus: "ok",
+      lastRemoteCheckAt: checkedAt,
+      lastRemoteRevision: data.serverRevision,
+      lastSyncError: ""
+    });
+    renderLocalSyncStatus();
+    setSyncCheckMessage(`Worker OK. Server revision ${data.serverRevision || 0}. No data transferred.`);
+  }catch(e){
+    saveLocalSyncStatus({
+      status: "remote-check-error",
+      lastRemoteStatus: "error",
+      lastRemoteCheckAt: checkedAt,
+      lastSyncError: e && e.message ? e.message : String(e || "Sync check failed")
+    });
+    renderLocalSyncStatus();
+    setSyncCheckMessage(`Sync check failed: ${e && e.message ? e.message : e}`);
+  }finally{
+    if (btn) btn.disabled = false;
+  }
+}
+
+function latestTimestampFromValues(values, fallback = ""){
+  return values.reduce((latest, value) => {
+    const candidate = String(value || "");
+    if (!isValidIsoString(candidate)) return latest;
+    return !latest || candidate > latest ? candidate : latest;
+  }, fallback || "");
+}
+
+function latestPassageTimestamp(p){
+  if (isDeletedPassage(p)) {
+    return latestTimestampFromValues([p?.deletedAt, p?.updatedAt, p?.dirtyAt, p?.createdAt], "");
+  }
+  const entryTimes = (Array.isArray(p?.entries) ? p.entries : []).flatMap((entry) => [
+    entry?.updatedAt,
+    entry?.createdAt,
+    entry?.dirtyAt,
+    entry?.deletedAt,
+    entry?.time
+  ]);
+  return latestTimestampFromValues([
+    p?.updatedAt,
+    p?.createdAt,
+    p?.dirtyAt,
+    ...(Array.isArray(p?.legEnds) ? p.legEnds.map((leg) => leg?.updatedAt || leg?.endedAt) : []),
+    ...entryTimes
+  ], "");
+}
+
+function loadSyncRecordMeta(){
+  try{
+    const parsed = JSON.parse(storage.getItem(SYNC_RECORD_META_KEY) || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  }catch{
+    return {};
+  }
+}
+
+function saveSyncRecordMeta(meta){
+  try{
+    storage.setItem(SYNC_RECORD_META_KEY, JSON.stringify(meta && typeof meta === "object" ? meta : {}));
+  }catch(e){
+    console.warn("Could not save sync record metadata", e);
+  }
+}
+
+function rememberSyncRecordMeta(record){
+  const recordId = String(record?.recordId || "");
+  const clientUpdatedAt = String(record?.clientUpdatedAt || "");
+  if (!recordId || !isValidIsoString(clientUpdatedAt)) return;
+  const meta = loadSyncRecordMeta();
+  meta[recordId] = {
+    clientUpdatedAt,
+    lastChangedDeviceId: String(record?.lastChangedDeviceId || "")
+  };
+  saveSyncRecordMeta(meta);
+}
+
+function forgetSyncRecordMeta(recordId){
+  const cleanRecordId = String(recordId || "");
+  if (!cleanRecordId) return;
+  const meta = loadSyncRecordMeta();
+  if (!meta[cleanRecordId]) return;
+  delete meta[cleanRecordId];
+  saveSyncRecordMeta(meta);
+}
+
+function createSyncRecord(recordId, recordType, payload, timestamp, lastChangedDeviceId = getOrCreateDeviceId()){
+  const cleanTimestamp = isValidIsoString(timestamp) ? timestamp : nowIso();
+  return {
+    recordId,
+    recordType,
+    schemaVersion: LOCAL_DATA_SCHEMA_VERSION,
+    clientUpdatedAt: cleanTimestamp,
+    lastChangedDeviceId,
+    deleted: payload?.deleted === true,
+    payload: {
+      format: "steeler-sync-record",
+      version: 1,
+      appVersion: APP_VERSION,
+      recordType,
+      updatedAt: cleanTimestamp,
+      data: payload
+    }
+  };
+}
+
+function createGlobalSyncRecord(recordId, recordType, payload, fallbackTime, meta){
+  const saved = meta?.[recordId];
+  if (saved && isValidIsoString(saved.clientUpdatedAt)) {
+    return createSyncRecord(recordId, recordType, payload, saved.clientUpdatedAt, saved.lastChangedDeviceId || getOrCreateDeviceId());
+  }
+  return createSyncRecord(recordId, recordType, payload, fallbackTime);
+}
+
+function buildLocalSyncRecords(){
+  normalisePassagesForSync(passages);
+  const status = getLocalSyncSummary();
+  const fallbackTime = status.lastLocalChangeAt || nowIso();
+  const syncMeta = loadSyncRecordMeta();
+  const records = [];
+
+  (Array.isArray(passages) ? passages : []).forEach((p) => {
+    if (!p?.id) return;
+    records.push(createSyncRecord(`passage:${p.id}`, "passage", p, latestPassageTimestamp(p) || fallbackTime));
+  });
+
+  records.push(createGlobalSyncRecord("global:ports", "ports", { all: knownPorts, recent: recentPorts }, fallbackTime, syncMeta));
+  records.push(createGlobalSyncRecord("global:safety-info", "safety-info", getSafetyInfo(), fallbackTime, syncMeta));
+  records.push(createGlobalSyncRecord("global:legacy-ec-settings", "legacy-ec-settings", loadEcSettings(), fallbackTime, syncMeta));
+  records.push(createGlobalSyncRecord("global:dpp-templates", "dpp-templates", loadDppTemplateStore(), fallbackTime, syncMeta));
+  records.push(createGlobalSyncRecord("global:dpp-waypoints", "dpp-waypoints", loadDppWaypointStore(), fallbackTime, syncMeta));
+  records.push(createGlobalSyncRecord("global:weather-abbreviations", "weather-abbreviations", loadAbbrDb(), fallbackTime, syncMeta));
+  records.push(createGlobalSyncRecord("global:fuel-management", "fuel-management", loadFuelManagementSettings(), fallbackTime, syncMeta));
+  records.push(createGlobalSyncRecord("global:app-settings", "app-settings", {
+    theme: storage.getItem(THEME_KEY) || "day",
+    logSplitRatio: storage.getItem(LOG_SPLIT_RATIO_KEY) || ""
+  }, fallbackTime, syncMeta));
+
+  return records;
+}
+
+function clearSyncDirtyForRecordIds(recordIds){
+  const ids = new Set(Array.isArray(recordIds) ? recordIds : []);
+  let passagesChanged = false;
+  let portsChanged = false;
+
+  (Array.isArray(passages) ? passages : []).forEach((p) => {
+    if (!p?.id || !ids.has(`passage:${p.id}`)) return;
+    if (p.syncDirty || p.syncStatus || p.dirtyAt) {
+      p.syncDirty = false;
+      p.syncStatus = "synced";
+      p.dirtyAt = "";
+      passagesChanged = true;
+    }
+    (Array.isArray(p.entries) ? p.entries : []).forEach((entry) => {
+      if (!entry || typeof entry !== "object") return;
+      if (entry.syncDirty || entry.syncStatus || entry.dirtyAt) {
+        entry.syncDirty = false;
+        entry.syncStatus = "synced";
+        entry.dirtyAt = "";
+        passagesChanged = true;
+      }
+    });
+  });
+
+  if (ids.has("global:ports")) {
+    (Array.isArray(knownPorts) ? knownPorts : []).forEach((port) => {
+      if (!port || typeof port !== "object") return;
+      if (port.syncDirty || port.syncStatus || port.dirtyAt) {
+        port.syncDirty = false;
+        port.syncStatus = "synced";
+        port.dirtyAt = "";
+        portsChanged = true;
+      }
+    });
+  }
+
+  if (passagesChanged) savePassages();
+  if (portsChanged) {
+    saveLocalStorageItem(PORTS_KEY, JSON.stringify({ all: knownPorts, recent: recentPorts }), "ports");
+    refreshPortUI();
+  }
+
+  return { passagesChanged, portsChanged };
+}
+
+function markReceivedRecordClean(record){
+  const data = record?.payload?.data;
+  if (record?.recordType === "passage" && data && typeof data === "object") {
+    data.syncDirty = false;
+    data.syncStatus = "synced";
+    data.dirtyAt = "";
+    (Array.isArray(data.entries) ? data.entries : []).forEach((entry) => {
+      if (!entry || typeof entry !== "object") return;
+      entry.syncDirty = false;
+      entry.syncStatus = "synced";
+      entry.dirtyAt = "";
+    });
+  }
+  if (record?.recordType === "ports" && data && typeof data === "object") {
+    (Array.isArray(data.all) ? data.all : []).forEach((port) => {
+      if (!port || typeof port !== "object") return;
+      port.syncDirty = false;
+      port.syncStatus = "synced";
+      port.dirtyAt = "";
+    });
+  }
+  return record;
+}
+
+function applySyncRecord(record){
+  const type = String(record?.recordType || "");
+  const data = record?.payload?.data;
+  if (!type || data === undefined) return false;
+
+  markReceivedRecordClean(record);
+
+  if (type === "passage") {
+    if (!data || typeof data !== "object" || !data.id) return false;
+    const idx = (Array.isArray(passages) ? passages : []).findIndex((p) => p?.id === data.id);
+    if (idx >= 0) passages[idx] = data;
+    else passages.unshift(data);
+    normalisePassagesForSync(passages);
+    saveLocalStorageItem(STORAGE_KEY, JSON.stringify(passages), "passages");
+    return true;
+  }
+
+  if (type === "ports") {
+    knownPorts = Array.isArray(data?.all) ? data.all : [];
+    recentPorts = Array.isArray(data?.recent) ? data.recent : [];
+    cleanPortsInPlace();
+    saveLocalStorageItem(PORTS_KEY, JSON.stringify({ all: knownPorts, recent: recentPorts }), "ports");
+    return true;
+  }
+
+  if (type === "safety-info") {
+    saveLocalStorageItem(SAFETY_INFO_KEY, JSON.stringify(data), "Safety / Emergency Info");
+    return true;
+  }
+
+  if (type === "legacy-ec-settings") {
+    saveLocalStorageItem(EC_SETTINGS_KEY, JSON.stringify(data), "legacy emergency contact settings");
+    return true;
+  }
+
+  if (type === "dpp-templates") {
+    saveDppTemplateStore(data);
+    return true;
+  }
+
+  if (type === "dpp-waypoints") {
+    saveDppWaypointStore(data);
+    return true;
+  }
+
+  if (type === "weather-abbreviations") {
+    saveLocalStorageItem(ABBR_DB_KEY, JSON.stringify(data), "weather abbreviations");
+    return true;
+  }
+
+  if (type === "fuel-management") {
+    saveFuelManagementSettings(data);
+    return true;
+  }
+
+  if (type === "app-settings") {
+    if (data && typeof data === "object") {
+      if (data.theme) applyTheme(data.theme);
+      if (data.logSplitRatio !== undefined && data.logSplitRatio !== null) {
+        storage.setItem(LOG_SPLIT_RATIO_KEY, String(data.logSplitRatio));
+      }
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function applySyncRecords(records){
+  let applied = 0;
+  (Array.isArray(records) ? records : []).forEach((record) => {
+    if (applySyncRecord(record)) applied += 1;
+  });
+  if (applied > 0) refreshAfterDataRestore();
+  return applied;
+}
+
+function compareLocalAndRemoteSyncRecords(localRecords, remoteRecords){
+  const remoteById = new Map((Array.isArray(remoteRecords) ? remoteRecords : []).map((record) => [record.recordId, record]));
+  const localById = new Map((Array.isArray(localRecords) ? localRecords : []).map((record) => [record.recordId, record]));
+  const wouldUpload = [];
+  const wouldDownload = [];
+  const conflicts = [];
+  const matched = [];
+
+  localRecords.forEach((local) => {
+    const remote = remoteById.get(local.recordId);
+    if (!remote) {
+      wouldUpload.push({ record: local, reason: "not in cloud yet" });
+      return;
+    }
+    matched.push(local.recordId);
+    const localTime = String(local.clientUpdatedAt || "");
+    const remoteTime = String(remote.clientUpdatedAt || "");
+    const localDevice = String(local.lastChangedDeviceId || "");
+    const remoteDevice = String(remote.lastChangedDeviceId || "");
+    const differentDevice = !!(localDevice && remoteDevice && localDevice !== remoteDevice);
+    if (local.deleted !== remote.deleted) {
+      if (local.deleted) {
+        wouldUpload.push({ record: local, local, remote, reason: "deleted on this device" });
+      }
+      if (remote.deleted) {
+        wouldDownload.push({ record: remote, local, remote, reason: "deleted in cloud" });
+      }
+      return;
+    }
+    if (localTime !== remoteTime && differentDevice) {
+      conflicts.push({
+        local,
+        remote,
+        reason: localTime > remoteTime
+          ? "local is newer, but cloud was changed by another device"
+          : "cloud is newer, but local data differs"
+      });
+      return;
+    }
+    if (localTime > remoteTime) wouldUpload.push({ record: local, local, remote, reason: "local is newer" });
+    if (remoteTime > localTime) wouldDownload.push({ record: remote, local, remote, reason: "cloud is newer" });
+  });
+
+  remoteRecords.forEach((remote) => {
+    if (!localById.has(remote.recordId)) {
+      wouldDownload.push({ record: remote, reason: "not on this device" });
+    }
+  });
+
+  return {
+    localCount: localRecords.length,
+    remoteCount: remoteRecords.length,
+    matchedCount: matched.length,
+    wouldUpload,
+    wouldDownload,
+    conflicts
+  };
+}
+
+function syncRecordLabel(record){
+  const id = String(record?.recordId || "");
+  const type = String(record?.recordType || (id.startsWith("passage:") ? "passage" : id.replace(/^global:/, "")) || "record");
+  if (type === "passage") return id.replace(/^passage:/, "Passage ");
+  return type.replace(/-/g, " ").replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
+
+function normalisePortComparisonName(port){
+  return portName(port).trim().toLowerCase();
+}
+
+function comparablePortValue(port){
+  if (!port || typeof port !== "object") return "";
+  return JSON.stringify({
+    name: portName(port).trim(),
+    lat: port.lat ?? "",
+    lon: port.lon ?? "",
+    commsPilotage: port.commsPilotage || "",
+    comments: port.comments || ""
+  });
+}
+
+function summarisePortsDifference(localRecord, remoteRecord){
+  const localPorts = Array.isArray(localRecord?.payload?.data?.all) ? localRecord.payload.data.all : [];
+  const remotePorts = Array.isArray(remoteRecord?.payload?.data?.all) ? remoteRecord.payload.data.all : [];
+  const localRecent = Array.isArray(localRecord?.payload?.data?.recent) ? localRecord.payload.data.recent : [];
+  const remoteRecent = Array.isArray(remoteRecord?.payload?.data?.recent) ? remoteRecord.payload.data.recent : [];
+  const localByName = new Map(localPorts.map((port) => [normalisePortComparisonName(port), port]).filter(([name]) => !!name));
+  const remoteByName = new Map(remotePorts.map((port) => [normalisePortComparisonName(port), port]).filter(([name]) => !!name));
+  const added = [];
+  const removed = [];
+  const changed = [];
+
+  localByName.forEach((localPort, name) => {
+    const remotePort = remoteByName.get(name);
+    if (!remotePort) {
+      added.push(portName(localPort));
+      return;
+    }
+    if (comparablePortValue(localPort) !== comparablePortValue(remotePort)) changed.push(portName(localPort));
+  });
+  remoteByName.forEach((remotePort, name) => {
+    if (!localByName.has(name)) removed.push(portName(remotePort));
+  });
+
+  const parts = [
+    `${added.length} added`,
+    `${changed.length} changed`,
+    `${removed.length} removed`
+  ];
+  const names = [...added, ...changed, ...removed].filter(Boolean).slice(0, 4);
+  if (!added.length && !changed.length && !removed.length && JSON.stringify(localRecent) !== JSON.stringify(remoteRecent)) {
+    return "Ports: saved ports match; recent ports list differs";
+  }
+  return `Ports: ${parts.join(", ")}${names.length ? ` (${names.join(", ")}${added.length + changed.length + removed.length > names.length ? ", ..." : ""})` : ""}`;
+}
+
+function stableComparableJson(value){
+  if (Array.isArray(value)) return `[${value.map(stableComparableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableComparableJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value ?? "");
+}
+
+function summariseNamedListDifference(label, localItems, remoteItems, options = {}){
+  const keyField = options.keyField || "id";
+  const nameField = options.nameField || "name";
+  const keyFor = (item) => String(item?.[keyField] || item?.[nameField] || "").trim().toLowerCase();
+  const nameFor = (item) => String(item?.[nameField] || item?.[keyField] || "").trim();
+  const localByKey = new Map((Array.isArray(localItems) ? localItems : []).map((item) => [keyFor(item), item]).filter(([key]) => !!key));
+  const remoteByKey = new Map((Array.isArray(remoteItems) ? remoteItems : []).map((item) => [keyFor(item), item]).filter(([key]) => !!key));
+  const added = [];
+  const changed = [];
+  const removed = [];
+
+  localByKey.forEach((localItem, key) => {
+    const remoteItem = remoteByKey.get(key);
+    if (!remoteItem) {
+      added.push(nameFor(localItem));
+      return;
+    }
+    if (stableComparableJson(localItem) !== stableComparableJson(remoteItem)) changed.push(nameFor(localItem));
+  });
+  remoteByKey.forEach((remoteItem, key) => {
+    if (!localByKey.has(key)) removed.push(nameFor(remoteItem));
+  });
+
+  const names = [...added, ...changed, ...removed].filter(Boolean).slice(0, 4);
+  return `${label}: ${added.length} added, ${changed.length} changed, ${removed.length} removed${names.length ? ` (${names.join(", ")}${added.length + changed.length + removed.length > names.length ? ", ..." : ""})` : ""}`;
+}
+
+function flattenDiffPaths(value, prefix = ""){
+  if (!value || typeof value !== "object") return [];
+  if (Array.isArray(value)) return [prefix || "list"];
+  return Object.keys(value).flatMap((key) => {
+    const next = prefix ? `${prefix}.${key}` : key;
+    const child = value[key];
+    if (child && typeof child === "object" && !Array.isArray(child)) return flattenDiffPaths(child, next);
+    return [next];
+  });
+}
+
+function summariseObjectDifference(label, localData, remoteData){
+  const localPaths = new Set(flattenDiffPaths(localData));
+  const remotePaths = new Set(flattenDiffPaths(remoteData));
+  const allPaths = Array.from(new Set([...localPaths, ...remotePaths])).sort();
+  const changed = allPaths.filter((path) => {
+    const getPath = (obj) => path.split(".").reduce((value, part) => value && typeof value === "object" ? value[part] : undefined, obj);
+    return stableComparableJson(getPath(localData)) !== stableComparableJson(getPath(remoteData));
+  });
+  const shown = changed.slice(0, 4).map((path) => path.replace(/\./g, " / "));
+  return `${label}: ${changed.length} field${changed.length === 1 ? "" : "s"} differ${shown.length ? ` (${shown.join(", ")}${changed.length > shown.length ? ", ..." : ""})` : ""}`;
+}
+
+function summariseWeatherAbbreviationsDifference(localRecord, remoteRecord){
+  const localRules = Array.isArray(localRecord?.payload?.data?.rules) ? localRecord.payload.data.rules : [];
+  const remoteRules = Array.isArray(remoteRecord?.payload?.data?.rules) ? remoteRecord.payload.data.rules : [];
+  return summariseNamedListDifference("Weather abbreviations", localRules, remoteRules, { keyField: "id", nameField: "abbr" });
+}
+
+function syncRecordDetail(item){
+  const local = item?.local || item?.record || null;
+  const remote = item?.remote || null;
+  const recordType = String(local?.recordType || remote?.recordType || "");
+  if (recordType === "ports") return summarisePortsDifference(local, remote);
+  if (recordType === "dpp-templates") {
+    return summariseNamedListDifference("DPP templates", local?.payload?.data?.templates, remote?.payload?.data?.templates);
+  }
+  if (recordType === "dpp-waypoints") {
+    return summariseNamedListDifference("DPP waypoints", local?.payload?.data?.waypoints, remote?.payload?.data?.waypoints);
+  }
+  if (recordType === "weather-abbreviations") return summariseWeatherAbbreviationsDifference(local, remote);
+  if (recordType === "safety-info") return summariseObjectDifference("Safety info", local?.payload?.data, remote?.payload?.data);
+  if (recordType === "legacy-ec-settings") return summariseObjectDifference("Legacy emergency contacts", local?.payload?.data, remote?.payload?.data);
+  if (recordType === "fuel-management") return summariseObjectDifference("Fuel settings", local?.payload?.data, remote?.payload?.data);
+  if (recordType === "app-settings") return summariseObjectDifference("App settings", local?.payload?.data, remote?.payload?.data);
+  return "";
+}
+
+function renderSyncPreview(comparison, remoteRevision){
+  const el = document.getElementById("syncPreviewResults");
+  if (!el) return;
+  const uploadItems = comparison.wouldUpload.slice(0, 8).map((item) => {
+    const detail = syncRecordDetail(item);
+    return `<li>${escapeHtml(syncRecordLabel(item.record))} <span>${escapeHtml(item.reason)}</span>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}</li>`;
+  }).join("");
+  const downloadItems = comparison.wouldDownload.slice(0, 8).map((item) => {
+    const detail = syncRecordDetail(item);
+    return `<li>${escapeHtml(syncRecordLabel(item.record))} <span>${escapeHtml(item.reason)}</span>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}</li>`;
+  }).join("");
+  const conflictItems = (comparison.conflicts || []).slice(0, 8).map((item) => {
+    const recordId = item.local?.recordId || item.remote?.recordId || "";
+    const detail = syncRecordDetail(item);
+    return `
+      <li>
+        ${escapeHtml(syncRecordLabel(item.local || item.remote))}
+        <span>${escapeHtml(item.reason)}</span>
+        ${detail ? `<span>${escapeHtml(detail)}</span>` : ""}
+        <div class="sync-conflict-actions">
+          <button type="button" class="btn btn-secondary sync-conflict-choice-btn" data-record-id="${escapeHtml(recordId)}" data-choice="local">Keep this device</button>
+          <button type="button" class="btn btn-secondary sync-conflict-choice-btn" data-record-id="${escapeHtml(recordId)}" data-choice="cloud">Use cloud</button>
+        </div>
+      </li>
+    `;
+  }).join("");
+  el.innerHTML = `
+    <div class="sync-preview-panel">
+      <div class="sync-status-grid">
+        <div><span>Local sync records</span><strong>${comparison.localCount}</strong></div>
+        <div><span>Cloud sync records</span><strong>${comparison.remoteCount}</strong></div>
+        <div><span>Safe to send</span><strong>${comparison.wouldUpload.length}</strong></div>
+        <div><span>Safe to receive</span><strong>${comparison.wouldDownload.length}</strong></div>
+        <div><span>Needs review</span><strong>${(comparison.conflicts || []).length}</strong></div>
+        <div><span>Cloud revision</span><strong>${remoteRevision || 0}</strong></div>
+      </div>
+      <div class="sync-preview-lists">
+        <div>
+          <strong>Safe send preview</strong>
+          <ul>${uploadItems || "<li>Nothing to upload</li>"}</ul>
+        </div>
+        <div>
+          <strong>Safe receive preview</strong>
+          <ul>${downloadItems || "<li>Nothing to receive</li>"}</ul>
+        </div>
+        <div class="${conflictItems ? "sync-conflict-list" : ""}">
+          <strong>Needs review</strong>
+          <ul>${conflictItems || "<li>No possible conflicts</li>"}</ul>
+        </div>
+      </div>
+      <p class="hint">Preview only. No records were uploaded, downloaded into the app, merged or restored.</p>
+    </div>
+  `;
+  bindSyncConflictControls();
+}
+
+function bindSyncConflictControls(){
+  document.querySelectorAll(".sync-conflict-choice-btn").forEach((btn) => {
+    if (btn.dataset.bound === "1") return;
+    btn.dataset.bound = "1";
+    btn.addEventListener("click", () => resolveSyncConflict(btn.dataset.recordId || "", btn.dataset.choice || "", btn));
+  });
+}
+
+function setSyncConflictButtonsDisabled(disabled){
+  document.querySelectorAll(".sync-conflict-choice-btn").forEach((btn) => {
+    btn.disabled = disabled;
+  });
+}
+
+async function refreshManualSyncPreview(connection, messagePrefix = ""){
+  const checkedAt = nowIso();
+  const localRecords = buildLocalSyncRecords();
+  const remote = await fetchRemoteSyncRecordSummary(connection);
+  const comparison = compareLocalAndRemoteSyncRecords(localRecords, remote.records);
+  renderSyncPreview(comparison, remote.serverRevision);
+  saveLocalSyncStatus({
+    status: "sync-preview-ok",
+    lastRemoteStatus: "ok",
+    lastRemoteCheckAt: checkedAt,
+    lastRemoteRevision: remote.serverRevision,
+    lastSyncPreviewAt: checkedAt,
+    lastSyncPreviewUploadCount: comparison.wouldUpload.length,
+    lastSyncPreviewDownloadCount: comparison.wouldDownload.length,
+    lastSyncPreviewConflictCount: (comparison.conflicts || []).length,
+    lastSyncError: ""
+  });
+  setSyncCheckMessage(`${messagePrefix}${comparison.wouldUpload.length} safe to send, ${comparison.wouldDownload.length} safe to receive, ${(comparison.conflicts || []).length} need review.`);
+  return { comparison, remote };
+}
+
+async function resolveSyncConflict(recordId, choice, btn){
+  const cleanRecordId = String(recordId || "").trim();
+  const cleanChoice = String(choice || "");
+  const connection = getSavedSyncConnection();
+  if (connection.error) {
+    setSyncCheckMessage(connection.error);
+    return;
+  }
+  if (!cleanRecordId || !["local", "cloud"].includes(cleanChoice)) {
+    setSyncCheckMessage("Could not identify the review item. Please run Preview Sync again.");
+    return;
+  }
+
+  const label = syncRecordLabel({ recordId: cleanRecordId });
+  const actionText = cleanChoice === "local" ? "keep this device's version" : "use the cloud version";
+  const ok = confirm(
+    `Resolve ${label}?\n\n` +
+    `This will ${actionText} for this one review item only. Other review items will be left alone.`
+  );
+  if (!ok) {
+    setSyncCheckMessage("Review item left unchanged.");
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  setSyncConflictButtonsDisabled(true);
+  const resolvedAt = nowIso();
+
+  try{
+    const localRecords = buildLocalSyncRecords();
+    const localRecord = localRecords.find((record) => record.recordId === cleanRecordId);
+    if (cleanChoice === "local") {
+      if (!localRecord) throw new Error("This device no longer has that local record.");
+      setSyncCheckMessage(`Sending ${label} from this device...`);
+      const res = await fetch(`${connection.baseUrl}/v1/records/push`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${connection.config.token}`
+        },
+        cache: "no-store",
+        body: JSON.stringify({
+          deviceId: getOrCreateDeviceId(),
+          records: [localRecord]
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok !== true) {
+        throw new Error(data.error || `Worker returned ${res.status}`);
+      }
+      const accepted = Array.isArray(data.accepted) ? data.accepted : [];
+      if (accepted.length !== 1 || accepted[0]?.recordId !== cleanRecordId) {
+        throw new Error("The Worker did not accept the selected review item.");
+      }
+      rememberSyncRecordMeta(localRecord);
+      clearSyncDirtyForRecordIds([cleanRecordId]);
+      saveLocalSyncStatus({
+        status: "sync-conflict-local-ok",
+        lastRemoteStatus: "ok",
+        lastRemoteCheckAt: resolvedAt,
+        lastRemoteRevision: data.serverRevision,
+        lastSyncAt: resolvedAt,
+        pendingLocalChanges: countPendingLocalChanges(),
+        lastSyncError: ""
+      });
+      renderLocalSyncStatus();
+      await refreshManualSyncPreview(connection, `${label} resolved by keeping this device. `);
+      return;
+    }
+
+    setSyncCheckMessage(`Receiving ${label} from cloud...`);
+    const remoteFull = await fetchRemoteSyncRecords(connection);
+    const remoteRecord = remoteFull.records.find((record) => record.recordId === cleanRecordId);
+    if (!remoteRecord) throw new Error("Cloud no longer has that record.");
+
+    downloadJsonPayload(createDataBackupPayload(), "STEELER-Before-sync-review-backup");
+    const applied = applySyncRecords([remoteRecord]);
+    if (applied !== 1) throw new Error("Could not apply the selected cloud record.");
+    rememberSyncRecordMeta(remoteRecord);
+    saveLocalSyncStatus({
+      status: "sync-conflict-cloud-ok",
+      lastRemoteStatus: "ok",
+      lastRemoteCheckAt: resolvedAt,
+      lastRemoteRevision: remoteFull.serverRevision,
+      lastSyncAt: resolvedAt,
+      lastSyncRecordReceiveAt: resolvedAt,
+      lastSyncRecordReceiveCount: applied,
+      pendingLocalChanges: countPendingLocalChanges(),
+      lastSyncError: ""
+    });
+    renderLocalSyncStatus();
+    await refreshManualSyncPreview(connection, `${label} resolved by using cloud. `);
+  }catch(e){
+    saveLocalSyncStatus({
+      status: "sync-conflict-error",
+      lastRemoteStatus: "error",
+      lastRemoteCheckAt: resolvedAt,
+      lastSyncError: e && e.message ? e.message : String(e || "Review item failed")
+    });
+    setSyncCheckMessage(`Review item failed: ${e && e.message ? e.message : e}`);
+    setSyncConflictButtonsDisabled(false);
+  }
+}
+
+async function previewManualSync(){
+  const btn = document.getElementById("syncPreviewBtn");
+  const connection = getSavedSyncConnection();
+  if (connection.error) {
+    setSyncCheckMessage(connection.error);
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  setSyncCheckMessage("Previewing sync...");
+  const checkedAt = nowIso();
+
+  try{
+    const localRecords = buildLocalSyncRecords();
+    const res = await fetch(`${connection.baseUrl}/v1/records/summary?includeBackups=0&limit=500`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${connection.config.token}`
+      },
+      cache: "no-store"
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok !== true) {
+      throw new Error(data.error || `Worker returned ${res.status}`);
+    }
+
+    const remoteRecords = Array.isArray(data.records) ? data.records : [];
+    const comparison = compareLocalAndRemoteSyncRecords(localRecords, remoteRecords);
+    renderSyncPreview(comparison, data.serverRevision);
+    saveLocalSyncStatus({
+      status: "sync-preview-ok",
+      lastRemoteStatus: "ok",
+      lastRemoteCheckAt: checkedAt,
+      lastRemoteRevision: data.serverRevision,
+      lastSyncPreviewAt: checkedAt,
+      lastSyncPreviewUploadCount: comparison.wouldUpload.length,
+      lastSyncPreviewDownloadCount: comparison.wouldDownload.length,
+      lastSyncPreviewConflictCount: (comparison.conflicts || []).length,
+      lastSyncError: ""
+    });
+    setSyncCheckMessage(`Sync preview complete. ${comparison.wouldUpload.length} safe to send, ${comparison.wouldDownload.length} safe to receive, ${(comparison.conflicts || []).length} need review. Nothing changed.`);
+  }catch(e){
+    saveLocalSyncStatus({
+      status: "sync-preview-error",
+      lastRemoteStatus: "error",
+      lastRemoteCheckAt: checkedAt,
+      lastSyncError: e && e.message ? e.message : String(e || "Sync preview failed")
+    });
+    setSyncCheckMessage(`Sync preview failed: ${e && e.message ? e.message : e}`);
+  }finally{
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function fetchRemoteSyncRecordSummary(connection){
+  const res = await fetch(`${connection.baseUrl}/v1/records/summary?includeBackups=0&limit=500`, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${connection.config.token}`
+    },
+    cache: "no-store"
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok !== true) {
+    throw new Error(data.error || `Worker returned ${res.status}`);
+  }
+  return {
+    records: Array.isArray(data.records) ? data.records : [],
+    serverRevision: data.serverRevision
+  };
+}
+
+async function pushManualSyncRecords(){
+  const btn = document.getElementById("syncPushRecordsBtn");
+  const connection = getSavedSyncConnection();
+  if (connection.error) {
+    setSyncCheckMessage(connection.error);
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  setSyncCheckMessage("Checking which sync records need sending...");
+  const pushedAt = nowIso();
+
+  try{
+    const localRecords = buildLocalSyncRecords();
+    const remote = await fetchRemoteSyncRecordSummary(connection);
+    const comparison = compareLocalAndRemoteSyncRecords(localRecords, remote.records);
+    renderSyncPreview(comparison, remote.serverRevision);
+
+    const recordsToPush = comparison.wouldUpload.map((item) => item.record);
+    if ((comparison.conflicts || []).length) {
+      setSyncCheckMessage(`${comparison.conflicts.length} possible conflict${comparison.conflicts.length === 1 ? "" : "s"} need review. Safe records can still be sent, but conflicted records will be left alone.`);
+    }
+    if (!recordsToPush.length) {
+      saveLocalSyncStatus({
+        status: "sync-push-noop",
+        lastRemoteStatus: "ok",
+        lastRemoteCheckAt: pushedAt,
+        lastRemoteRevision: remote.serverRevision,
+        lastSyncError: ""
+      });
+      setSyncCheckMessage("No sync records need sending. Nothing changed.");
+      return;
+    }
+
+    const ok = confirm(
+      `Send ${recordsToPush.length} sync record${recordsToPush.length === 1 ? "" : "s"} to Cloudflare?\n\n` +
+      "This uploads safe local sync records only. Possible conflicts are left alone. It will not receive, merge, restore or overwrite anything on this device."
+    );
+    if (!ok) {
+      setSyncCheckMessage("Send Sync Records cancelled. Nothing changed.");
+      return;
+    }
+
+    setSyncCheckMessage(`Sending ${recordsToPush.length} sync record${recordsToPush.length === 1 ? "" : "s"}...`);
+    const res = await fetch(`${connection.baseUrl}/v1/records/push`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${connection.config.token}`
+      },
+      cache: "no-store",
+      body: JSON.stringify({
+        deviceId: getOrCreateDeviceId(),
+        records: recordsToPush
+      })
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok !== true) {
+      throw new Error(data.error || `Worker returned ${res.status}`);
+    }
+
+    const accepted = Array.isArray(data.accepted) ? data.accepted : [];
+    const rejected = Array.isArray(data.rejected) ? data.rejected : [];
+    if (accepted.length !== recordsToPush.length || rejected.length) {
+      throw new Error(`Worker accepted ${accepted.length} of ${recordsToPush.length} records.`);
+    }
+
+    recordsToPush.forEach(rememberSyncRecordMeta);
+    clearSyncDirtyForRecordIds(accepted.map((record) => record.recordId));
+    saveLocalSyncStatus({
+      status: "sync-push-ok",
+      lastRemoteStatus: "ok",
+      lastRemoteCheckAt: pushedAt,
+      lastRemoteRevision: data.serverRevision,
+      lastSyncAt: pushedAt,
+      lastSyncRecordPushAt: pushedAt,
+      lastSyncRecordPushCount: accepted.length,
+      pendingLocalChanges: countPendingLocalChanges(),
+      lastSyncError: ""
+    });
+    renderLocalSyncStatus();
+    setSyncCheckMessage(`Sent ${accepted.length} sync record${accepted.length === 1 ? "" : "s"} to Cloudflare. No records were received or merged.`);
+  }catch(e){
+    saveLocalSyncStatus({
+      status: "sync-push-error",
+      lastRemoteStatus: "error",
+      lastRemoteCheckAt: pushedAt,
+      lastSyncError: e && e.message ? e.message : String(e || "Sync record upload failed")
+    });
+    setSyncCheckMessage(`Send Sync Records failed: ${e && e.message ? e.message : e}`);
+  }finally{
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function fetchRemoteSyncRecords(connection){
+  const res = await fetch(`${connection.baseUrl}/v1/records?since=0&limit=500`, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${connection.config.token}`
+    },
+    cache: "no-store"
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok !== true) {
+    throw new Error(data.error || `Worker returned ${res.status}`);
+  }
+  return {
+    records: Array.isArray(data.records) ? data.records.filter((record) => record.recordType !== "cloud-backup") : [],
+    serverRevision: data.serverRevision
+  };
+}
+
+async function fullManualSync(){
+  const btn = document.getElementById("syncFullBtn");
+  const connection = getSavedSyncConnection();
+  if (connection.error) {
+    setSyncCheckMessage(connection.error);
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  setSyncCheckMessage("Checking what Full Sync can safely move...");
+  const syncedAt = nowIso();
+
+  try{
+    const localRecords = buildLocalSyncRecords();
+    const remote = await fetchRemoteSyncRecordSummary(connection);
+    const comparison = compareLocalAndRemoteSyncRecords(localRecords, remote.records);
+    renderSyncPreview(comparison, remote.serverRevision);
+
+    const recordsToPush = comparison.wouldUpload.map((item) => item.record);
+    const idsToReceive = new Set(comparison.wouldDownload.map((item) => item.record.recordId));
+    const conflictCount = (comparison.conflicts || []).length;
+
+    if (!recordsToPush.length && !idsToReceive.size) {
+      saveLocalSyncStatus({
+        status: "sync-full-noop",
+        lastRemoteStatus: "ok",
+        lastRemoteCheckAt: syncedAt,
+        lastRemoteRevision: remote.serverRevision,
+        lastSyncError: ""
+      });
+      setSyncCheckMessage(conflictCount
+        ? `No safe records to sync. ${conflictCount} need review. Nothing changed.`
+        : "Everything already looks in sync. Nothing changed.");
+      return;
+    }
+
+    const reviewText = conflictCount
+      ? `\n\n${conflictCount} review item${conflictCount === 1 ? "" : "s"} will be left untouched.`
+      : "";
+    const receiveText = idsToReceive.size
+      ? "\n\nA safety backup of current local data will download before cloud records are received."
+      : "";
+    const ok = confirm(
+      `Run Full Sync?\n\n` +
+      `This will send ${recordsToPush.length} safe record${recordsToPush.length === 1 ? "" : "s"} and receive ${idsToReceive.size} safe record${idsToReceive.size === 1 ? "" : "s"}.` +
+      reviewText + receiveText
+    );
+    if (!ok) {
+      setSyncCheckMessage("Full Sync cancelled. Nothing changed.");
+      return;
+    }
+
+    let accepted = [];
+    let serverRevision = remote.serverRevision;
+    if (recordsToPush.length) {
+      setSyncCheckMessage(`Full Sync: sending ${recordsToPush.length} safe record${recordsToPush.length === 1 ? "" : "s"}...`);
+      const res = await fetch(`${connection.baseUrl}/v1/records/push`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${connection.config.token}`
+        },
+        cache: "no-store",
+        body: JSON.stringify({
+          deviceId: getOrCreateDeviceId(),
+          records: recordsToPush
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok !== true) {
+        throw new Error(data.error || `Worker returned ${res.status}`);
+      }
+      accepted = Array.isArray(data.accepted) ? data.accepted : [];
+      const rejected = Array.isArray(data.rejected) ? data.rejected : [];
+      if (accepted.length !== recordsToPush.length || rejected.length) {
+        throw new Error(`Worker accepted ${accepted.length} of ${recordsToPush.length} records.`);
+      }
+      recordsToPush.forEach(rememberSyncRecordMeta);
+      clearSyncDirtyForRecordIds(accepted.map((record) => record.recordId));
+      serverRevision = data.serverRevision;
+    }
+
+    let applied = 0;
+    if (idsToReceive.size) {
+      setSyncCheckMessage(`Full Sync: receiving ${idsToReceive.size} safe record${idsToReceive.size === 1 ? "" : "s"}...`);
+      const remoteFull = await fetchRemoteSyncRecords(connection);
+      const recordsToApply = remoteFull.records.filter((record) => idsToReceive.has(record.recordId));
+      if (recordsToApply.length !== idsToReceive.size) {
+        throw new Error(`Found ${recordsToApply.length} of ${idsToReceive.size} expected cloud records.`);
+      }
+      downloadJsonPayload(createDataBackupPayload(), "STEELER-Before-full-sync-backup");
+      applied = applySyncRecords(recordsToApply);
+      recordsToApply.forEach(rememberSyncRecordMeta);
+      serverRevision = remoteFull.serverRevision;
+    }
+
+    const statusUpdate = {
+      status: "sync-full-ok",
+      lastRemoteStatus: "ok",
+      lastRemoteCheckAt: syncedAt,
+      lastRemoteRevision: serverRevision,
+      lastSyncAt: syncedAt,
+      lastSyncRecordPushCount: accepted.length,
+      lastSyncRecordReceiveCount: applied,
+      pendingLocalChanges: countPendingLocalChanges(),
+      lastSyncError: ""
+    };
+    if (accepted.length) statusUpdate.lastSyncRecordPushAt = syncedAt;
+    if (applied) statusUpdate.lastSyncRecordReceiveAt = syncedAt;
+    saveLocalSyncStatus(statusUpdate);
+    renderLocalSyncStatus();
+    await refreshManualSyncPreview(
+      connection,
+      `Full Sync complete. Sent ${accepted.length}, received ${applied}. `
+    );
+  }catch(e){
+    saveLocalSyncStatus({
+      status: "sync-full-error",
+      lastRemoteStatus: "error",
+      lastRemoteCheckAt: syncedAt,
+      lastSyncError: e && e.message ? e.message : String(e || "Full Sync failed")
+    });
+    setSyncCheckMessage(`Full Sync failed: ${e && e.message ? e.message : e}`);
+  }finally{
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function receiveManualSyncRecords(){
+  const btn = document.getElementById("syncReceiveRecordsBtn");
+  const connection = getSavedSyncConnection();
+  if (connection.error) {
+    setSyncCheckMessage(connection.error);
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  setSyncCheckMessage("Checking which sync records can be received...");
+  const receivedAt = nowIso();
+
+  try{
+    const localRecords = buildLocalSyncRecords();
+    const remote = await fetchRemoteSyncRecordSummary(connection);
+    const comparison = compareLocalAndRemoteSyncRecords(localRecords, remote.records);
+    renderSyncPreview(comparison, remote.serverRevision);
+
+    const idsToReceive = new Set(comparison.wouldDownload.map((item) => item.record.recordId));
+    if ((comparison.conflicts || []).length) {
+      setSyncCheckMessage(`${comparison.conflicts.length} possible conflict${comparison.conflicts.length === 1 ? "" : "s"} need review. Safe receive records can still be applied, but conflicted records will be left alone.`);
+    }
+    if (!idsToReceive.size) {
+      saveLocalSyncStatus({
+        status: "sync-receive-noop",
+        lastRemoteStatus: "ok",
+        lastRemoteCheckAt: receivedAt,
+        lastRemoteRevision: remote.serverRevision,
+        lastSyncError: ""
+      });
+      setSyncCheckMessage("No sync records need receiving. Nothing changed.");
+      return;
+    }
+
+    const caution = comparison.wouldUpload.length
+      ? `\n\nThis device also has ${comparison.wouldUpload.length} local sync record${comparison.wouldUpload.length === 1 ? "" : "s"} that would upload. Receive Sync Records will NOT send them.`
+      : "";
+    const ok = confirm(
+      `Receive ${idsToReceive.size} sync record${idsToReceive.size === 1 ? "" : "s"} from Cloudflare?` +
+      caution + "\n\n" +
+      "A safety backup of current local data will download first. This will apply only the cloud records shown in the Safe receive preview. Possible conflicts are left alone."
+    );
+    if (!ok) {
+      setSyncCheckMessage("Receive Sync Records cancelled. Nothing changed.");
+      return;
+    }
+
+    const secondOk = confirm(
+      "Final confirmation\n\n" +
+      "This will apply received cloud sync records to this device. It will not send MacBook-local records to Cloudflare.\n\n" +
+      "Continue?"
+    );
+    if (!secondOk) {
+      setSyncCheckMessage("Receive Sync Records cancelled. Nothing changed.");
+      return;
+    }
+
+    setSyncCheckMessage(`Receiving ${idsToReceive.size} sync record${idsToReceive.size === 1 ? "" : "s"}...`);
+
+    const remoteFull = await fetchRemoteSyncRecords(connection);
+    const recordsToApply = remoteFull.records.filter((record) => idsToReceive.has(record.recordId));
+    if (recordsToApply.length !== idsToReceive.size) {
+      throw new Error(`Found ${recordsToApply.length} of ${idsToReceive.size} expected cloud records.`);
+    }
+
+    downloadJsonPayload(createDataBackupPayload(), "STEELER-Before-sync-receive-backup");
+    const applied = applySyncRecords(recordsToApply);
+    recordsToApply.forEach(rememberSyncRecordMeta);
+    saveLocalSyncStatus({
+      status: "sync-receive-ok",
+      lastRemoteStatus: "ok",
+      lastRemoteCheckAt: receivedAt,
+      lastRemoteRevision: remoteFull.serverRevision,
+      lastSyncAt: receivedAt,
+      lastSyncRecordReceiveAt: receivedAt,
+      lastSyncRecordReceiveCount: applied,
+      pendingLocalChanges: countPendingLocalChanges(),
+      lastSyncError: ""
+    });
+    renderLocalSyncStatus();
+    setSyncCheckMessage(`Received ${applied} sync record${applied === 1 ? "" : "s"} from Cloudflare. No local records were sent.`);
+  }catch(e){
+    saveLocalSyncStatus({
+      status: "sync-receive-error",
+      lastRemoteStatus: "error",
+      lastRemoteCheckAt: receivedAt,
+      lastSyncError: e && e.message ? e.message : String(e || "Sync receive failed")
+    });
+    setSyncCheckMessage(`Receive Sync Records failed: ${e && e.message ? e.message : e}`);
+  }finally{
+    if (btn) btn.disabled = false;
+  }
+}
+
+function renderCloudBackups(backups){
+  const el = document.getElementById("syncCloudBackups");
+  if (!el) return;
+
+  if (!Array.isArray(backups) || backups.length === 0) {
+    el.innerHTML = `<p class="hint">No cloud backups found yet.</p>`;
+    return;
+  }
+
+  el.innerHTML = `
+    <div class="sync-cloud-backup-list">
+      ${backups.map((backup) => {
+        const deviceId = String(backup.deviceId || "");
+        const shortDeviceId = deviceId ? deviceId.slice(0, 18) : "Unknown";
+        const passageText = backup.passageCount == null
+          ? "Passages unknown"
+          : `${backup.passageCount} passage${backup.passageCount === 1 ? "" : "s"}`;
+        return `
+          <div class="sync-cloud-backup-item">
+            <div>
+              <strong>${escapeHtml(formatSyncStatusTime(backup.createdAt))}</strong>
+              <span>${escapeHtml(`${backup.appVersion || "Unknown version"} · ${passageText}`)}</span>
+            </div>
+            <div>
+              <span>${escapeHtml(`Device ${shortDeviceId}`)}</span>
+              <span>${escapeHtml(`Revision ${backup.serverRevision || 0}`)}</span>
+              <button type="button" class="btn btn-secondary sync-download-backup-btn" data-record-id="${escapeHtml(backup.recordId || "")}">Download Backup</button>
+              <button type="button" class="btn btn-danger sync-restore-backup-btn" data-record-id="${escapeHtml(backup.recordId || "")}">Restore Backup</button>
+            </div>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+  bindCloudBackupDownloadControls();
+  bindCloudBackupRestoreControls();
+}
+
+async function refreshCloudBackups(options = {}){
+  const btn = document.getElementById("syncRefreshBackupsBtn");
+  const connection = getSavedSyncConnection();
+  if (connection.error) {
+    setSyncCheckMessage(connection.error);
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  if (!options.silent) setSyncCheckMessage("Checking cloud backup list...");
+  const checkedAt = nowIso();
+
+  try{
+    const res = await fetch(`${connection.baseUrl}/v1/backups?limit=5`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${connection.config.token}`
+      },
+      cache: "no-store"
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok !== true) {
+      throw new Error(data.error || `Worker returned ${res.status}`);
+    }
+
+    const backups = Array.isArray(data.backups) ? data.backups : [];
+    saveLocalSyncStatus({
+      status: "cloud-backup-list-ok",
+      lastRemoteStatus: "ok",
+      lastRemoteCheckAt: checkedAt,
+      lastRemoteRevision: data.serverRevision,
+      lastCloudBackupListAt: checkedAt,
+      lastCloudBackupCount: backups.length,
+      lastSyncError: ""
+    });
+    renderCloudBackups(backups);
+    if (!options.silent) {
+      setSyncCheckMessage(`Found ${backups.length} cloud backup${backups.length === 1 ? "" : "s"}. No data was downloaded or changed.`);
+    }
+  }catch(e){
+    saveLocalSyncStatus({
+      status: "cloud-backup-list-error",
+      lastRemoteStatus: "error",
+      lastRemoteCheckAt: checkedAt,
+      lastSyncError: e && e.message ? e.message : String(e || "Cloud backup list failed")
+    });
+    renderCloudBackups([]);
+    setSyncCheckMessage(`Cloud backup list failed: ${e && e.message ? e.message : e}`);
+  }finally{
+    if (btn) btn.disabled = false;
+  }
+}
+
+function bindCloudBackupDownloadControls(){
+  document.querySelectorAll(".sync-download-backup-btn").forEach((btn) => {
+    if (btn.dataset.bound === "1") return;
+    btn.dataset.bound = "1";
+    btn.addEventListener("click", () => downloadCloudBackup(btn.dataset.recordId || "", btn));
+  });
+}
+
+function bindCloudBackupRestoreControls(){
+  document.querySelectorAll(".sync-restore-backup-btn").forEach((btn) => {
+    if (btn.dataset.bound === "1") return;
+    btn.dataset.bound = "1";
+    btn.addEventListener("click", () => restoreCloudBackup(btn.dataset.recordId || "", btn));
+  });
+}
+
+async function downloadCloudBackup(recordId, btn){
+  const cleanRecordId = String(recordId || "").trim();
+  if (!cleanRecordId) {
+    setSyncCheckMessage("Cloud backup record id is missing.");
+    return;
+  }
+
+  const connection = getSavedSyncConnection();
+  if (connection.error) {
+    setSyncCheckMessage(connection.error);
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  setSyncCheckMessage("Downloading cloud backup JSON...");
+  const checkedAt = nowIso();
+
+  try{
+    const res = await fetch(`${connection.baseUrl}/v1/backups/${encodeURIComponent(cleanRecordId)}`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${connection.config.token}`
+      },
+      cache: "no-store"
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok !== true || !data.backup) {
+      throw new Error(data.error || `Worker returned ${res.status}`);
+    }
+
+    downloadJsonPayload(data.backup, "STEELER-Cloud-data-backup");
+    saveLocalSyncStatus({
+      status: "cloud-backup-download-ok",
+      lastRemoteStatus: "ok",
+      lastRemoteCheckAt: checkedAt,
+      lastRemoteRevision: data.summary?.serverRevision,
+      lastCloudBackupDownloadAt: checkedAt,
+      lastCloudBackupDownloadRecordId: cleanRecordId,
+      lastSyncError: ""
+    });
+    setSyncCheckMessage("Cloud backup downloaded as a JSON file. Nothing was restored or changed in the app.");
+  }catch(e){
+    saveLocalSyncStatus({
+      status: "cloud-backup-download-error",
+      lastRemoteStatus: "error",
+      lastRemoteCheckAt: checkedAt,
+      lastSyncError: e && e.message ? e.message : String(e || "Cloud backup download failed")
+    });
+    setSyncCheckMessage(`Cloud backup download failed: ${e && e.message ? e.message : e}`);
+  }finally{
+    if (btn) btn.disabled = false;
+  }
+}
+
+function describeDataBackupForRestore(backup, summary = {}){
+  const passagesCount = Array.isArray(backup?.data?.passages) ? backup.data.passages.length : 0;
+  const exportedAt = backup?.exportedAt || summary.createdAt || "";
+  const appVersion = backup?.appVersion || summary.appVersion || "Unknown version";
+  const deviceId = backup?.exportedByDeviceId || summary.deviceId || "Unknown device";
+  const latestPassage = Array.isArray(backup?.data?.passages)
+    ? backup.data.passages.reduce((latest, p) => {
+        const candidate = p?.updatedAt || p?.createdAt || p?.plan?.date || "";
+        if (!candidate) return latest;
+        return !latest || String(candidate) > String(latest) ? String(candidate) : latest;
+      }, "")
+    : "";
+  return [
+    `Backup date: ${formatSyncStatusTime(exportedAt)}`,
+    `App version: ${appVersion}`,
+    `Passages: ${passagesCount}`,
+    `Device: ${String(deviceId).slice(0, 24)}`,
+    latestPassage ? `Latest passage/change: ${latestPassage}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+async function fetchCloudBackupRecord(recordId){
+  const cleanRecordId = String(recordId || "").trim();
+  if (!cleanRecordId) throw new Error("Cloud backup record id is missing.");
+
+  const connection = getSavedSyncConnection();
+  if (connection.error) throw new Error(connection.error);
+
+  const res = await fetch(`${connection.baseUrl}/v1/backups/${encodeURIComponent(cleanRecordId)}`, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${connection.config.token}`
+    },
+    cache: "no-store"
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok !== true || !data.backup) {
+    throw new Error(data.error || `Worker returned ${res.status}`);
+  }
+  return data;
+}
+
+async function restoreCloudBackup(recordId, btn){
+  const cleanRecordId = String(recordId || "").trim();
+  if (!cleanRecordId) {
+    setSyncCheckMessage("Cloud backup record id is missing.");
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  setSyncCheckMessage("Fetching cloud backup for restore...");
+  const checkedAt = nowIso();
+
+  try{
+    const data = await fetchCloudBackupRecord(cleanRecordId);
+    const backup = data.backup;
+    if (!backup || backup.format !== DATA_BACKUP_FORMAT || !backup.data || !Array.isArray(backup.data.passages)) {
+      throw new Error("Cloud backup is not a valid STEELER data backup.");
+    }
+
+    const details = describeDataBackupForRestore(backup, data.summary || {});
+    const firstOk = confirm(
+      "Restore this cloud backup?\n\n" +
+      details + "\n\n" +
+      "This will replace passages, ports, Safety / Emergency Info, DPP templates, saved waypoints, weather abbreviations, fuel settings and app settings on this device.\n\n" +
+      "A safety backup of the current local data will download first."
+    );
+    if (!firstOk) {
+      setSyncCheckMessage("Cloud backup restore cancelled. Nothing was changed.");
+      return;
+    }
+
+    const secondOk = confirm(
+      "Final confirmation\n\n" +
+      "This is a restore, not a sync. Current local data will be replaced by the selected cloud backup.\n\n" +
+      "Continue?"
+    );
+    if (!secondOk) {
+      setSyncCheckMessage("Cloud backup restore cancelled. Nothing was changed.");
+      return;
+    }
+
+    downloadJsonPayload(createDataBackupPayload(), "STEELER-Before-cloud-restore-backup");
+    const restored = restoreDataBackupObject(backup, { skipConfirm: true, successMessage: "Cloud backup restored successfully." });
+    if (!restored) throw new Error("Cloud backup restore did not complete.");
+
+    saveLocalSyncStatus({
+      status: "cloud-backup-restore-ok",
+      lastRemoteStatus: "ok",
+      lastRemoteCheckAt: checkedAt,
+      lastRemoteRevision: data.summary?.serverRevision,
+      lastCloudBackupRestoreAt: checkedAt,
+      lastCloudBackupRestoreRecordId: cleanRecordId,
+      lastSyncError: ""
+    });
+    renderLocalSyncStatus();
+    setSyncCheckMessage("Cloud backup restored. A safety backup of the previous local data was downloaded first.");
+  }catch(e){
+    saveLocalSyncStatus({
+      status: "cloud-backup-restore-error",
+      lastRemoteStatus: "error",
+      lastRemoteCheckAt: checkedAt,
+      lastSyncError: e && e.message ? e.message : String(e || "Cloud backup restore failed")
+    });
+    setSyncCheckMessage(`Cloud backup restore failed: ${e && e.message ? e.message : e}`);
+  }finally{
+    if (btn) btn.disabled = false;
+  }
+}
+
+function createCloudBackupRecord(backupPayload){
+  const timestamp = nowIso();
+  const deviceId = getOrCreateDeviceId();
+  return {
+    recordId: makeStableId("cloud_backup"),
+    recordType: "cloud-backup",
+    schemaVersion: LOCAL_DATA_SCHEMA_VERSION,
+    clientUpdatedAt: timestamp,
+    lastChangedDeviceId: deviceId,
+    payload: {
+      format: "steeler-cloud-backup-record",
+      version: 1,
+      createdAt: timestamp,
+      appVersion: APP_VERSION,
+      deviceId,
+      backup: backupPayload
+    }
+  };
+}
+
+async function sendCloudBackup(){
+  const btn = document.getElementById("syncSendBackupBtn");
+  const connection = getSavedSyncConnection();
+  if (connection.error) {
+    setSyncCheckMessage(connection.error);
+    return;
+  }
+
+  const ok = confirm("Send one full STEELER data backup to Cloudflare?\n\nThis uploads a backup copy only. It will not pull, merge, restore or overwrite anything on this device.");
+  if (!ok) return;
+
+  if (btn) btn.disabled = true;
+  setSyncCheckMessage("Sending one backup copy to Cloudflare...");
+  const sentAt = nowIso();
+
+  try{
+    const backup = createDataBackupPayload();
+    const record = createCloudBackupRecord(backup);
+    const res = await fetch(`${connection.baseUrl}/v1/records/push`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${connection.config.token}`
+      },
+      cache: "no-store",
+      body: JSON.stringify({
+        deviceId: getOrCreateDeviceId(),
+        records: [record]
+      })
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok !== true) {
+      throw new Error(data.error || `Worker returned ${res.status}`);
+    }
+
+    const accepted = Array.isArray(data.accepted) ? data.accepted[0] : null;
+    if (!accepted || accepted.recordId !== record.recordId) {
+      throw new Error("Worker did not accept the backup record.");
+    }
+
+    saveLocalSyncStatus({
+      status: "cloud-backup-ok",
+      lastRemoteStatus: "ok",
+      lastRemoteCheckAt: sentAt,
+      lastRemoteRevision: data.serverRevision,
+      lastCloudBackupAt: sentAt,
+      lastCloudBackupRecordId: record.recordId,
+      lastCloudBackupRevision: accepted.serverRevision,
+      lastSyncError: ""
+    });
+    renderLocalSyncStatus();
+    setSyncCheckMessage(`Cloud backup sent. Server revision ${accepted.serverRevision || data.serverRevision || 0}. No data was pulled or merged.`);
+    refreshCloudBackups({ silent: true });
+  }catch(e){
+    saveLocalSyncStatus({
+      status: "cloud-backup-error",
+      lastRemoteStatus: "error",
+      lastRemoteCheckAt: sentAt,
+      lastSyncError: e && e.message ? e.message : String(e || "Cloud backup failed")
+    });
+    renderLocalSyncStatus();
+    setSyncCheckMessage(`Cloud backup failed: ${e && e.message ? e.message : e}`);
+  }finally{
+    if (btn) btn.disabled = false;
+  }
+}
+
+function downloadJsonPayload(payload, filenamePrefix){
+  const json = JSON.stringify(payload, null, 2);
+  const blob = new Blob([json], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+
+  const d = new Date();
+  const y = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const da = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const filename = `${filenamePrefix}-${y}${mo}${da}${hh}${mm}.json`;
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
 
 function warnStorageSaveFailed(label, error){
   console.warn(`Failed to save ${label}`, error);
@@ -1372,6 +3183,133 @@ function setupTidePasteModal(){
 
 // --- Storage helpers -----------------------------------------------
 
+function normaliseLogEntrySyncFields(entry, passage, fallbackDate, deviceId){
+  if (!entry || typeof entry !== "object") return false;
+  let changed = false;
+  if (!entry.id) {
+    entry.id = makeStableId("e");
+    changed = true;
+  }
+  const fallbackCreatedAt = isValidIsoString(entry.time)
+    ? new Date(entry.time).toISOString()
+    : (isValidIsoString(passage?.createdAt) ? passage.createdAt : fallbackDate);
+  if (!isValidIsoString(entry.createdAt)) {
+    entry.createdAt = fallbackCreatedAt;
+    changed = true;
+  }
+  if (!isValidIsoString(entry.updatedAt)) {
+    entry.updatedAt = entry.createdAt;
+    changed = true;
+  }
+  if (!entry.schemaVersion) {
+    entry.schemaVersion = LOCAL_DATA_SCHEMA_VERSION;
+    changed = true;
+  }
+  if (!entry.lastModifiedDeviceId) {
+    entry.lastModifiedDeviceId = deviceId;
+    changed = true;
+  }
+  if (entry.deleted === true && !isValidIsoString(entry.deletedAt)) {
+    entry.deletedAt = entry.updatedAt;
+    changed = true;
+  }
+  if (entry.deleted !== true && entry.deletedAt) {
+    entry.deletedAt = "";
+    changed = true;
+  }
+  return changed;
+}
+
+function isDeletedLogEntry(entry){
+  return !!(entry && entry.deleted === true);
+}
+
+function activeLogEntries(p){
+  return (Array.isArray(p?.entries) ? p.entries : []).filter(entry => !isDeletedLogEntry(entry));
+}
+
+function markPassageDirty(p, timestamp = nowIso(), reason = "passage-change"){
+  if (!p || typeof p !== "object") return;
+  p.updatedAt = timestamp;
+  p.schemaVersion = LOCAL_DATA_SCHEMA_VERSION;
+  p.lastModifiedDeviceId = getOrCreateDeviceId();
+  p.syncDirty = true;
+  p.syncStatus = "pending";
+  p.dirtyAt = timestamp;
+  recordLocalSyncChange(reason, timestamp);
+}
+
+function markLogEntryDirty(entry, p, options = {}){
+  if (!entry || typeof entry !== "object") return;
+  const timestamp = options.at || nowIso();
+  const deviceId = getOrCreateDeviceId();
+  if (!entry.id) entry.id = makeStableId("e");
+  if (!isValidIsoString(entry.createdAt)) entry.createdAt = isValidIsoString(entry.time) ? new Date(entry.time).toISOString() : timestamp;
+  entry.updatedAt = timestamp;
+  entry.schemaVersion = LOCAL_DATA_SCHEMA_VERSION;
+  entry.lastModifiedDeviceId = deviceId;
+  entry.syncDirty = true;
+  entry.syncStatus = "pending";
+  entry.dirtyAt = timestamp;
+  if (options.deleted === true) {
+    entry.deleted = true;
+    entry.deletedAt = timestamp;
+  }
+  markPassageDirty(p, timestamp, options.deleted === true ? "log-entry-delete" : "log-entry-change");
+}
+
+function normalisePassageSyncFields(passage, deviceId){
+  if (!passage || typeof passage !== "object") return false;
+  let changed = false;
+  const fallbackDate = nowIso();
+  if (!passage.id) {
+    passage.id = makeStableId("p");
+    changed = true;
+  }
+  if (!isValidIsoString(passage.createdAt)) {
+    passage.createdAt = fallbackDate;
+    changed = true;
+  }
+  if (!isValidIsoString(passage.updatedAt)) {
+    passage.updatedAt = passage.createdAt;
+    changed = true;
+  }
+  if (!passage.schemaVersion) {
+    passage.schemaVersion = LOCAL_DATA_SCHEMA_VERSION;
+    changed = true;
+  }
+  if (!passage.lastModifiedDeviceId) {
+    passage.lastModifiedDeviceId = deviceId;
+    changed = true;
+  }
+  if (passage.deleted === true && !isValidIsoString(passage.deletedAt)) {
+    passage.deletedAt = passage.updatedAt;
+    changed = true;
+  }
+  if (passage.deleted !== true && passage.deletedAt) {
+    passage.deletedAt = "";
+    changed = true;
+  }
+  if (!Array.isArray(passage.entries)) {
+    passage.entries = [];
+    changed = true;
+  }
+  passage.entries.forEach((entry) => {
+    if (normaliseLogEntrySyncFields(entry, passage, passage.createdAt, deviceId)) changed = true;
+  });
+  return changed;
+}
+
+function normalisePassagesForSync(passagesList){
+  if (!Array.isArray(passagesList)) return false;
+  const deviceId = getOrCreateDeviceId();
+  let changed = false;
+  passagesList.forEach((passage) => {
+    if (normalisePassageSyncFields(passage, deviceId)) changed = true;
+  });
+  return changed;
+}
+
 function loadPassages() {
   passages = loadLocalStorageJsonItem(
     STORAGE_KEY,
@@ -1379,10 +3317,12 @@ function loadPassages() {
     [],
     Array.isArray
   );
+  if (normalisePassagesForSync(passages)) savePassages();
 }
 
 function savePassages() {
   try {
+    normalisePassagesForSync(passages);
     saveLocalStorageItem(STORAGE_KEY, JSON.stringify(passages), "passages");
   } catch (e) {
     console.error("Failed to save passages", e);
@@ -1414,6 +3354,19 @@ function loadPorts() {
 
   // ensure every port has a stable id
   try{ for (const p of knownPorts){ ensurePortId(p); } }catch{}
+  try{
+    const deviceId = getOrCreateDeviceId();
+    const now = nowIso();
+    let changed = false;
+    for (const p of knownPorts){
+      if (!p || typeof p !== "object") continue;
+      if (!isValidIsoString(p.createdAt)) { p.createdAt = now; changed = true; }
+      if (!isValidIsoString(p.updatedAt)) { p.updatedAt = p.createdAt; changed = true; }
+      if (!p.schemaVersion) { p.schemaVersion = LOCAL_DATA_SCHEMA_VERSION; changed = true; }
+      if (!p.lastModifiedDeviceId) { p.lastModifiedDeviceId = deviceId; changed = true; }
+    }
+    if (changed) savePorts();
+  }catch{}
 
   // Strip any legacy tideId fields from stored ports (no longer used)
   try{ for (const p of knownPorts){ if (p && typeof p === 'object' && 'tideId' in p) delete p.tideId; } }catch{}
@@ -1421,8 +3374,26 @@ function loadPorts() {
 
 function savePorts() {
   try {
+    const deviceId = getOrCreateDeviceId();
+    const now = nowIso();
+    let syncTouched = false;
+    (knownPorts || []).forEach((p) => {
+      if (!p || typeof p !== "object") return;
+      ensurePortId(p);
+      if (!isValidIsoString(p.createdAt)) p.createdAt = now;
+      if (!isValidIsoString(p.updatedAt)) p.updatedAt = now;
+      if (!p.schemaVersion) p.schemaVersion = LOCAL_DATA_SCHEMA_VERSION;
+      if (!p.lastModifiedDeviceId) p.lastModifiedDeviceId = deviceId;
+      if (!p.syncDirty) {
+        p.syncDirty = true;
+        p.syncStatus = "pending";
+        p.dirtyAt = now;
+        syncTouched = true;
+      }
+    });
     const payload = { all: knownPorts, recent: recentPorts };
     saveLocalStorageItem(PORTS_KEY, JSON.stringify(payload), "ports");
+    if (syncTouched) recordLocalSyncChange("ports-change", now);
     // If Plan comms is empty, auto-fill from updated port data
     try { updatePlanCommsFromPorts(); } catch(e) {}
     try { updatePlanSummaryPanel(); } catch(e) {}
@@ -1572,7 +3543,8 @@ function getPortCoords(name){
 // --- Sunrise / sunset calculation (NOAA approximation, offline) ----------
 
 function getCurrentPassage() {
-  return passages.find(p => p.id === currentPassageId) || null;
+  const passage = passages.find(p => p.id === currentPassageId) || null;
+  return isDeletedPassage(passage) ? null : passage;
 }
 
 function normalisePassageTimeZone(value) {
@@ -1628,6 +3600,46 @@ function escapeHtml(str) {
     .replace(/'/g, "&#039;");
 }
 
+function linkifyNoteHtml(value){
+  const text = String(value || "");
+  if (!text) return "";
+  const urlPattern = /\b((?:https?:\/\/|www\.)[^\s<>"']+|(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s<>"']*)?)/gi;
+  let html = "";
+  let lastIndex = 0;
+  text.replace(urlPattern, (match, _url, offset) => {
+    html += escapeHtml(text.slice(lastIndex, offset));
+    const trailing = match.match(/[),.;:!?]+$/)?.[0] || "";
+    const clean = trailing ? match.slice(0, -trailing.length) : match;
+    const lower = clean.toLowerCase();
+    const href = lower.startsWith("http://") || lower.startsWith("https://") ? clean : `https://${clean}`;
+    html += `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" data-note-link="true">${escapeHtml(clean)}</a>${escapeHtml(trailing)}`;
+    lastIndex = offset + match.length;
+    return match;
+  });
+  html += escapeHtml(text.slice(lastIndex));
+  return html.replace(/\n/g, "<br>");
+}
+
+function activateNoteLinks(root){
+  root?.querySelectorAll?.("a[data-note-link]")?.forEach(link => {
+    if (link.dataset.noteLinkReady === "true") return;
+    link.dataset.noteLinkReady = "true";
+    link.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+    });
+  });
+}
+
+function getNoteLinkFromEvent(ev){
+  const target = ev?.target?.nodeType === 1 ? ev.target : ev?.target?.parentElement;
+  return target?.closest?.("a[data-note-link]") || null;
+}
+
+function holdNoteLinkTap(ev){
+  const link = getNoteLinkFromEvent(ev);
+  if (!link) return;
+  ev.stopPropagation();
+}
 
 function getPortCommsPilotageText(portNameStr){
   const name = (portNameStr || "").trim();
@@ -2495,39 +4507,36 @@ function closeModal(){
 
 // --- Backup / Restore ----------------------------------------------
 
-function exportBackup() {
+function createDataBackupPayload(){
+  normalisePassagesForSync(passages);
   const payload = {
-    format: "steeler-logbook-backup",
-    version: 3,
+    format: DATA_BACKUP_FORMAT,
+    version: 1,
+    schemaVersion: LOCAL_DATA_SCHEMA_VERSION,
     exportedAt: new Date().toISOString(),
+    appVersion: APP_VERSION,
+    exportedByDeviceId: getOrCreateDeviceId(),
     data: {
-						passages,
-						theme: storage.getItem(THEME_KEY) || "day",
-						safetyInfo: getSafetyInfo(),
+      passages,
+      theme: storage.getItem(THEME_KEY) || "day",
+      knownPorts: { all: knownPorts, recent: recentPorts },
+      safetyInfo: getSafetyInfo(),
+      legacyEcSettings: loadEcSettings(),
       dppTemplates: loadDppTemplateStore(),
-      dppWaypoints: loadDppWaypointStore()
-				}
+      dppWaypoints: loadDppWaypointStore(),
+      weatherAbbreviations: loadAbbrDb(),
+      fuelManagement: loadFuelManagementSettings(),
+      settings: {
+        logSplitRatio: storage.getItem(LOG_SPLIT_RATIO_KEY) || ""
+      },
+      localSyncStatus: getLocalSyncSummary()
+    }
   };
+  return payload;
+}
 
-  const json = JSON.stringify(payload, null, 2);
-  const blob = new Blob([json], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-
-  const d = new Date();
-  const y = d.getFullYear();
-  const mo = String(d.getMonth() + 1).padStart(2, "0");
-  const da = String(d.getDate()).padStart(2, "0");
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const filename = `STEELER-Logbook-backup-${y}${mo}${da}${hh}${mm}.json`;
-
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+function exportBackup() {
+  downloadJsonPayload(createDataBackupPayload(), "STEELER-Data-backup");
 }
 
 function exportPortsBackup() {
@@ -2593,57 +4602,119 @@ function exportDppTemplatesBackup() {
   URL.revokeObjectURL(url);
 }
 
+function refreshAfterDataRestore(){
+  refreshHomePassageList();
+  currentPassageId = getFirstActivePassage()?.id || null;
+  loadPassageIntoUI();
+  refreshPortUI();
+  try { injectSafetyEmergencySettingsBlock(); } catch(e) {}
+  try { injectFuelManagementSettingsBlock(); } catch(e) {}
+  importDppTemplateWaypointsToLibrary();
+  renderDppTemplatesManager();
+  renderDppWaypointsManager();
+  try { updatePlanSummaryPanel(); } catch(e) {}
+  try { renderLocalSyncStatus(); } catch(e) {}
+}
+
+function restoreDataBackupObject(obj, options = {}){
+  if (!obj || obj.format !== DATA_BACKUP_FORMAT || !obj.data) {
+    alert("That file doesn’t look like a STEELER data backup.");
+    return false;
+  }
+  if (!Array.isArray(obj.data.passages)) {
+    alert("Backup file is missing expected passage data.");
+    return false;
+  }
+
+  if (!options.skipConfirm) {
+    const ok = confirm(
+      "Restore full STEELER data backup?\n\n" +
+      "This will replace passages, ports, Safety / Emergency Info, DPP templates, saved waypoints, weather abbreviations, fuel settings and app settings on this device."
+    );
+    if (!ok) return false;
+  }
+
+  passages = obj.data.passages;
+  normalisePassagesForSync(passages);
+  saveLocalStorageItem(STORAGE_KEY, JSON.stringify(passages), "passages");
+
+  const portsPayload = obj.data.knownPorts || {};
+  knownPorts = Array.isArray(portsPayload.all) ? portsPayload.all : [];
+  recentPorts = Array.isArray(portsPayload.recent) ? portsPayload.recent : [];
+  cleanPortsInPlace();
+  savePorts();
+
+  if (obj.data.safetyInfo) {
+    saveLocalStorageItem(SAFETY_INFO_KEY, JSON.stringify(obj.data.safetyInfo), "Safety / Emergency Info");
+  }
+  if (obj.data.legacyEcSettings) {
+    saveLocalStorageItem(EC_SETTINGS_KEY, JSON.stringify(obj.data.legacyEcSettings), "legacy emergency contact settings");
+  }
+  if (obj.data.dppTemplates) saveDppTemplateStore(obj.data.dppTemplates);
+  if (obj.data.dppWaypoints) saveDppWaypointStore(obj.data.dppWaypoints);
+  if (obj.data.weatherAbbreviations) {
+    saveLocalStorageItem(ABBR_DB_KEY, JSON.stringify(obj.data.weatherAbbreviations), "weather abbreviations");
+  }
+  if (obj.data.fuelManagement) {
+    saveFuelManagementSettings(obj.data.fuelManagement);
+  }
+  if (obj.data.settings && obj.data.settings.logSplitRatio) {
+    storage.setItem(LOG_SPLIT_RATIO_KEY, String(obj.data.settings.logSplitRatio));
+  }
+  applyTheme(obj.data.theme || "day");
+  refreshAfterDataRestore();
+  alert(options.successMessage || "Full STEELER data backup restored successfully.");
+  return true;
+}
+
+function restoreLegacyLogbookBackupObject(obj){
+  if (!obj || obj.format !== "steeler-logbook-backup" || !obj.data) {
+    alert("That file doesn’t look like a STEELER Logbook backup.");
+    return false;
+  }
+  if (!Array.isArray(obj.data.passages)) {
+    alert("Backup file is missing expected passage data.");
+    return false;
+  }
+  const hasDppTemplates = !!obj.data.dppTemplates;
+  const hasDppWaypoints = !!obj.data.dppWaypoints;
+  const ok = confirm(
+    "Restore older logbook backup? This will REPLACE the current passages and Safety / Emergency Info on this device if present in the backup." +
+    (hasDppTemplates ? " DPP templates in the backup will also replace current DPP templates." : "") +
+    (hasDppWaypoints ? " DPP waypoints in the backup will also replace current DPP waypoints." : "") +
+    " Ports will be left unchanged."
+  );
+  if (!ok) return false;
+
+  passages = obj.data.passages;
+  normalisePassagesForSync(passages);
+  saveLocalStorageItem(STORAGE_KEY, JSON.stringify(passages), "passages");
+  if (obj.data.safetyInfo) {
+    try {
+      saveLocalStorageItem(SAFETY_INFO_KEY, JSON.stringify(obj.data.safetyInfo), "Safety / Emergency Info");
+    } catch(e) {
+      console.warn("Failed to restore Safety / Emergency Info", e);
+      warnStorageSaveFailed("Safety / Emergency Info", e);
+    }
+  }
+  if (hasDppTemplates) saveDppTemplateStore(obj.data.dppTemplates);
+  if (hasDppWaypoints) saveDppWaypointStore(obj.data.dppWaypoints);
+  applyTheme(obj.data.theme || "day");
+  refreshAfterDataRestore();
+  alert("Backup restored successfully. Ports were left unchanged.");
+  return true;
+}
+
 function importBackupFile(file) {
   const reader = new FileReader();
   reader.onload = () => {
     try {
       const obj = JSON.parse(reader.result);
-      if (!obj || obj.format !== "steeler-logbook-backup" || !obj.data) {
-        alert("That file doesn’t look like a STEELER Logbook backup.");
+      if (obj?.format === DATA_BACKUP_FORMAT) {
+        restoreDataBackupObject(obj);
         return;
       }
-      if (!Array.isArray(obj.data.passages)) {
-        alert("Backup file is missing expected passage data.");
-        return;
-      }
-      const hasDppTemplates = !!obj.data.dppTemplates;
-      const hasDppWaypoints = !!obj.data.dppWaypoints;
-      const ok = confirm(
-        "Restore backup? This will REPLACE the current passages and Safety / Emergency Info on this device if present in the backup." +
-        (hasDppTemplates ? " DPP templates in the backup will also replace current DPP templates." : "") +
-        (hasDppWaypoints ? " DPP waypoints in the backup will also replace current DPP waypoints." : "") +
-        " Ports will be left unchanged."
-      );
-      if (!ok) return;
-
-      passages = obj.data.passages;
-      saveLocalStorageItem(STORAGE_KEY, JSON.stringify(passages), "passages");
-							if (obj.data.safetyInfo) {
-									try {
-											saveLocalStorageItem(SAFETY_INFO_KEY, JSON.stringify(obj.data.safetyInfo), "Safety / Emergency Info");
-									} catch(e) {
-											console.warn("Failed to restore Safety / Emergency Info", e);
-											warnStorageSaveFailed("Safety / Emergency Info", e);
-									}
-							}
-      if (hasDppTemplates) {
-        saveDppTemplateStore(obj.data.dppTemplates);
-      }
-      if (hasDppWaypoints) {
-        saveDppWaypointStore(obj.data.dppWaypoints);
-      }
-      // Legacy support: if an older full backup still contains ports, preserve current ports.
-      // Ports are now managed separately via Export/Import Ports.
-      applyTheme(obj.data.theme || "day");
-
-      refreshHomePassageList();
-      currentPassageId = passages[0]?.id || null;
-      loadPassageIntoUI();
-      try { injectSafetyEmergencySettingsBlock(); } catch(e) {}
-      importDppTemplateWaypointsToLibrary();
-      renderDppTemplatesManager();
-      renderDppWaypointsManager();
-      alert("Backup restored successfully. Ports were left unchanged.");
+      restoreLegacyLogbookBackupObject(obj);
     } catch (e) {
       console.error(e);
       alert("Could not restore that file (invalid JSON).");
@@ -2842,13 +4913,16 @@ function deletePassageById(id) {
   if (idx < 0) return;
   const p = passages[idx];
   const label = `${p.plan.date || p.createdAt.slice(0,10)} – ${(p.plan.from||"?")} → ${(p.plan.to||"?")}`;
-  const ok = confirm(`Delete this passage?\n\n${label}\n\nThis cannot be undone (unless you’ve got a backup).`);
+  const ok = confirm(`Delete this passage?\n\n${label}\n\nIt will be hidden from the logbook and the deletion will sync to other devices.`);
   if (!ok) return;
 
-  passages.splice(idx, 1);
+  const timestamp = nowIso();
+  p.deleted = true;
+  p.deletedAt = timestamp;
+  markPassageDirty(p, timestamp, "passage-delete");
   savePassages();
 
-  if (currentPassageId === id) currentPassageId = passages[0]?.id || null;
+  if (currentPassageId === id) currentPassageId = getFirstActivePassage()?.id || null;
 
   refreshHomePassageList();
   loadPassageIntoUI();
@@ -3141,9 +5215,11 @@ function selectHomePassage(passage, { openLog = false } = {}) {
 
 function refreshHomePassageList() {
   homePassageList.innerHTML = "";
-  if (homeCopyPassageBtn) homeCopyPassageBtn.disabled = !currentPassageId || !passages.some(p => p.id === currentPassageId);
+  if (homeCopyPassageBtn) homeCopyPassageBtn.disabled = !currentPassageId || !passages.some(p => p.id === currentPassageId && !isDeletedPassage(p));
 
-  if (passages.length === 0) {
+  const visibleSourcePassages = activePassages();
+
+  if (visibleSourcePassages.length === 0) {
     const p = document.createElement("p");
     p.textContent = "No passages yet. Tap “+ New Passage” to get started.";
     p.className = "hint";
@@ -3152,7 +5228,7 @@ function refreshHomePassageList() {
     return;
   }
 
-  const visiblePassages = passages
+  const visiblePassages = visibleSourcePassages
     .filter(passage => passageMatchesHomeFilter(passage) && passageMatchesHomeSearch(passage))
     .slice()
     .sort((a, b) => {
@@ -3162,7 +5238,7 @@ function refreshHomePassageList() {
     });
 
   if (homePassageCount) {
-    const totalEntries = passages.reduce((sum, p) => sum + (p.entries?.length || 0), 0);
+    const totalEntries = visibleSourcePassages.reduce((sum, p) => sum + activeLogEntries(p).length, 0);
     homePassageCount.textContent = `${visiblePassages.length} passages • ${totalEntries} entries`;
   }
 
@@ -3181,7 +5257,7 @@ function refreshHomePassageList() {
     const date = getPassageDateValue(passage);
     const routeText = getRouteNames(passage).join(" → ") || "?";
     const status = getPassageDashboardStatus(passage);
-    const entriesCount = passage.entries?.length || 0;
+    const entriesCount = activeLogEntries(passage).length;
 
     const left = document.createElement("div");
     left.className = "passage-card-left";
@@ -3403,7 +5479,7 @@ function getLegCount(p) {
 }
 
 function countShutdowns(p) {
-  const entries = Array.isArray(p?.entries) ? p.entries : [];
+  const entries = activeLogEntries(p);
   return entries.filter(e => typeof e?.notes === "string" && e.notes.toLowerCase().startsWith("shutdown")).length;
 }
 
@@ -3415,8 +5491,9 @@ function getCurrentLegIndex(p) {
 
 function ensureEntryLegs(p) {
   if (!p || !Array.isArray(p.entries)) return;
-  if (p.entries.every(e => typeof e.leg === "number")) return;
-  const sorted = [...p.entries].sort((a, b) => String(a.time || "").localeCompare(String(b.time || "")));
+  const entries = activeLogEntries(p);
+  if (entries.every(e => typeof e.leg === "number")) return;
+  const sorted = entries.slice().sort((a, b) => String(a.time || "").localeCompare(String(b.time || "")));
   let leg = 0;
   for (const e of sorted) {
     if (typeof e.leg !== "number") e.leg = leg;
@@ -3428,7 +5505,7 @@ function ensureEntryLegs(p) {
 
 function hasSpecialForLeg(p, kind, legIdx) {
   ensureEntryLegs(p);
-  const entries = Array.isArray(p?.entries) ? p.entries : [];
+  const entries = activeLogEntries(p);
   const k = String(kind || "").toLowerCase();
   return entries.some(e => e.leg === legIdx && typeof e?.notes === "string" && e.notes.toLowerCase().startsWith(k));
 }
@@ -3457,7 +5534,7 @@ function updateLogStatusStrip() {
   const legCount = getLegCount(p);
   const route = getRouteLegNames(p, legIdx);
   const legSummary = computeLegLogSummary(p, legIdx);
-  const entries = Array.isArray(p.entries) ? p.entries : [];
+  const entries = activeLogEntries(p);
   const legEntries = entries.filter(e => (typeof e.leg === "number" ? e.leg : 0) === legIdx);
   const hasEngineStart = hasSpecialForLeg(p, "engine start", legIdx);
   const hasSlip = hasSpecialForLeg(p, "slipped lines", legIdx);
@@ -4432,6 +6509,7 @@ function savedWaypointToDppWaypoint(saved){
     lat: Number.isFinite(lat) ? lat : null,
     lon: Number.isFinite(lon) ? lon : null,
     distToNext: "",
+    manualDistToNext: "",
     cogToNext: "",
     plannedSpeed: "",
     timeToNext: "",
@@ -4480,6 +6558,7 @@ function routePortToDppWaypoint(point){
     lat: Number.isFinite(lat) ? lat : null,
     lon: Number.isFinite(lon) ? lon : null,
     distToNext: "",
+    manualDistToNext: "",
     cogToNext: "",
     plannedSpeed: "",
     timeToNext: "",
@@ -4541,6 +6620,7 @@ function readDppTemplateEditorForm(){
       lat: parsed ? parsed.lat : null,
       lon: parsed ? parsed.lon : null,
       distToNext: "",
+      manualDistToNext: (row.querySelector(".template-wp-distance-override")?.value || "").trim(),
       cogToNext: "",
       plannedSpeed: (row.querySelector(".template-wp-speed")?.value || "").trim(),
       timeToNext: "",
@@ -4568,6 +6648,7 @@ function renderDppTemplateEditorRows(detailed){
     <tr data-template-wp-row="${idx}" data-template-wp-id="${escapeHtml(wp.id || "")}">
       <td><input type="text" class="template-wp-name" value="${escapeHtml(wp.name || "")}" placeholder="Waypoint"></td>
       <td><input type="text" class="template-wp-coords" value="${escapeHtml(wp.coordsText || formatDetailedWaypointCoords(Number(wp.lat), Number(wp.lon)))}" placeholder="50.57507° N, 2.44846° W"></td>
+      <td><input type="number" step="0.1" inputmode="decimal" class="template-wp-distance-override" value="${escapeHtml(wp.manualDistToNext || "")}" placeholder="${wp.distToNext !== "" ? escapeHtml(String(wp.distToNext)) : "NM"}"></td>
       <td><input type="number" step="0.1" inputmode="decimal" class="template-wp-speed" value="${escapeHtml(wp.plannedSpeed || "")}" placeholder="kt"></td>
       <td><button type="button" class="btn btn-secondary btn-small template-wp-delete">Delete</button></td>
     </tr>
@@ -4599,11 +6680,12 @@ function openDppTemplateEditor(id){
         <input type="text" id="templateDppName" value="${escapeHtml(tpl.name)}">
       </label>
       <div style="overflow-x:auto; margin-top:0.8rem;">
-        <table class="log-table template-dpp-table" style="min-width:760px;">
+        <table class="log-table template-dpp-table" style="min-width:840px;">
           <thead>
             <tr>
               <th>Waypoint</th>
               <th>WP Lat/Lon</th>
+              <th>NM</th>
               <th>Plan kt</th>
               <th></th>
             </tr>
@@ -4659,6 +6741,7 @@ function openDppTemplateEditor(id){
       lat: null,
       lon: null,
       distToNext: "",
+      manualDistToNext: "",
       cogToNext: "",
       plannedSpeed: "",
       timeToNext: "",
@@ -4781,7 +6864,7 @@ function renderDppWaypointsManager(openId = ""){
         <div class="st-list-card-main">
           <div class="st-list-summary">
             <div class="st-list-title">${escapeHtml(wp.name || "Untitled WP")}</div>
-            <div class="st-list-meta">${escapeHtml(wp.coordsText || "No position stored")}${wp.notes ? ` · ${escapeHtml(wp.notes)}` : ""}</div>
+            <div class="st-list-meta">${escapeHtml(wp.coordsText || "No position stored")}${wp.notes ? ` · ${linkifyNoteHtml(wp.notes)}` : ""}</div>
           </div>
           <div class="st-row-edit-panel" ${isOpen ? "" : "hidden"}>
             <div class="st-form-grid st-form-grid-compact">
@@ -4885,6 +6968,7 @@ function readSettingsDppWorkspaceForm(){
       lat: parsed ? parsed.lat : null,
       lon: parsed ? parsed.lon : null,
       distToNext: "",
+      manualDistToNext: (row.querySelector(".dpp-distance-override")?.value || "").trim(),
       cogToNext: "",
       plannedSpeed: (row.querySelector(".dpp-speed")?.value || "").trim(),
       timeToNext: "",
@@ -5009,7 +7093,7 @@ function renderSettingsDppWorkspace(){
               <td><input type="text" class="dpp-time" value="${escapeHtml(wp.time || "")}" placeholder="HH:MM"></td>
               <td><input type="text" class="dpp-name" value="${escapeHtml(wp.name || "")}" placeholder="Waypoint"></td>
               <td><input type="text" class="dpp-coords" value="${escapeHtml(wp.coordsText || formatDetailedWaypointCoords(wp.lat, wp.lon))}" placeholder="50º45.123'N, 001º18.456'W or 50.752, -1.308"></td>
-              <td>${wp.distToNext !== "" ? escapeHtml(String(wp.distToNext)) : "–"}</td>
+              <td><input type="number" step="0.1" inputmode="decimal" class="dpp-distance-override" value="${escapeHtml(wp.manualDistToNext || "")}" placeholder="${wp.distToNext !== "" ? escapeHtml(String(wp.distToNext)) : "NM"}" title="Override distance to next waypoint"></td>
               <td>${wp.cogToNext ? escapeHtml(wp.cogToNext) : "–"}</td>
               <td><input type="number" step="0.1" inputmode="decimal" class="dpp-speed" value="${escapeHtml(wp.plannedSpeed || "")}" placeholder="kt"></td>
               <td>${wp.timeToNext ? escapeHtml(wp.timeToNext) : "–"}</td>
@@ -5110,6 +7194,7 @@ function renderSettingsDppWorkspace(){
       lat: null,
       lon: null,
       distToNext: "",
+      manualDistToNext: "",
       cogToNext: "",
       plannedSpeed: "",
       timeToNext: "",
@@ -5125,6 +7210,7 @@ function renderSettingsDppWorkspace(){
     if ((active.waypoints || []).length < 2) return;
     const firstTime = active.waypoints[0]?.time || "";
     active.waypoints.reverse();
+    active.waypoints.forEach((wp) => { wp.manualDistToNext = ""; });
     if (active.waypoints.length) active.waypoints[0].time = firstTime;
     for (let i = 1; i < active.waypoints.length; i++) active.waypoints[i].time = "";
     renderSettingsDppWorkspace();
@@ -6194,9 +8280,9 @@ function updatePlanSummaryPanel() {
 								return `<div class="daily-summary-item dpp-progress-item" title="${escapeHtml(label || "–")}">${escapeHtml(label || "–")}</div>`;
 						}).join("")
 				: "<p><em>–</em></p>";
-		const detailedHazardsHtml = detailed.hazards ? escapeHtml(detailed.hazards).replace(/\n/g, "<br>") : "<em>–</em>";
-		const detailedRefugeHtml = detailed.portsOfRefuge ? escapeHtml(detailed.portsOfRefuge).replace(/\n/g, "<br>") : "<em>–</em>";
-		const detailedWelfareHtml = detailed.crewWelfare ? escapeHtml(detailed.crewWelfare).replace(/\n/g, "<br>") : "<em>–</em>";
+		const detailedHazardsHtml = detailed.hazards ? linkifyNoteHtml(detailed.hazards) : "<em>–</em>";
+		const detailedRefugeHtml = detailed.portsOfRefuge ? linkifyNoteHtml(detailed.portsOfRefuge) : "<em>–</em>";
+		const detailedWelfareHtml = detailed.crewWelfare ? linkifyNoteHtml(detailed.crewWelfare) : "<em>–</em>";
 
   const tideStationsBlocks = tideStations.map(ts => {
     const stationName = (ts.name || "").trim();
@@ -6244,7 +8330,7 @@ function updatePlanSummaryPanel() {
     ? dailySummaries.map(ds => {
         const dateLabel = ds.date ? formatDateShort(ds.date) : "No date";
         const feeLabel  = ds.fee  ? ` – ${escapeHtml(ds.fee)}` : "";
-        const notesLabel = ds.notes ? ` – ${escapeHtml(ds.notes)}` : "";
+        const notesLabel = ds.notes ? ` – ${linkifyNoteHtml(ds.notes)}` : "";
         return `<div class="daily-summary-item plan-link" data-goto="dailySummariesContainer">${escapeHtml(dateLabel)}${feeLabel}${notesLabel}</div>`;
       }).join("")
     : '<p class="plan-link" data-goto="dailySummariesContainer"><em>–</em></p>';
@@ -6262,7 +8348,7 @@ function updatePlanSummaryPanel() {
 
         <div class="block plan-link" data-goto="planComms">
           <p class="section-title">COMMS / PILOTAGE</p>
-          <p>${comms ? escapeHtml(comms).replace(/\n/g, "<br>") : "<em>–</em>"}</p>
+          <p>${comms ? linkifyNoteHtml(comms) : "<em>–</em>"}</p>
         </div>
 
         <div class="block plan-link" data-goto="planTidalCoeff">
@@ -6299,6 +8385,7 @@ function updatePlanSummaryPanel() {
     </div>
   `;
 
+  activateNoteLinks(planSummaryPanel);
   try { setupPlanSummaryIndependentScroll(); } catch (e) {}
   try { updatePlanPageSummaryStrip(); } catch (e) {}
 }
@@ -6372,7 +8459,10 @@ function setupPlanSummaryIndependentScroll(){
   });
 }
 
+planSummaryPanel.addEventListener("pointerdown", holdNoteLinkTap, true);
+planSummaryPanel.addEventListener("touchstart", holdNoteLinkTap, true);
 planSummaryPanel.addEventListener("click", (e) => {
+  if (e.target.closest("a")) return;
   const target = e.target.closest(".plan-link");
   if (!target) return;
   const fieldId = target.dataset.goto;
@@ -6838,6 +8928,7 @@ async function openManualEntryDialog(entry, { isNew = false, passage = null } = 
         entry.notes = notes;
         if (!entry.wpReached && !entry.refuel) entry.entryType = 'manual';
 
+        markLogEntryDirty(entry, pForDialog);
         if (!isNew) {
           savePassages();
           renderLogEntries();
@@ -7067,6 +9158,7 @@ async function openEngineStartEntryDialog(p, legIdx, entry = null) {
             airPressureMb: vals.esAirPress, humidityPct: vals.esHumidity, airTempC: vals.esAirTemp,
             seaTempC: vals.esSeaTemp, windDir: vals.esWindDir, windBft: vals.esWindBft, notes: vals.esNotes
           });
+          markLogEntryDirty(entry, p);
           savePassages(); renderLogEntries(); refreshHomePassageList(); updateLogSummary(); updatePlanSummaryPanel();
           resolve(true); return;
         }
@@ -7090,6 +9182,7 @@ async function openEngineStartEntryDialog(p, legIdx, entry = null) {
 										notes: startNotes, entryType: 'engine-start', fuelStartPercentR: vals.esFuelR, fuelStartPercentC: vals.esFuelC,
 										engineHoursStart: vals.esEh, pob: vals.esPob, engineStartEnv: p.plan.engineStartEnv
 								};
+								markLogEntryDirty(newEntry, p);
 								p.entries.unshift(newEntry);
 								p.pob = vals.esPob;
 								p.flags.engineStart = true;
@@ -7206,14 +9299,17 @@ async function openShutdownEntryDialog(p, legIdx, isFinalLeg, entry = null) {
           entry.groundLog = vals.shGLog;
           entry.fuelUsed = vals.shFuelUsed;
           entry.shutdownNotes = vals.shNotes;
+          markLogEntryDirty(entry, p);
         } else {
-          p.entries.unshift({
+          const newEntry = {
             id: 'e_' + Date.now(), time: normalizeEntryTimeInput(vals.shTime, '', (p.plan?.date || '')), leg: legIdx,
             lat: '', lon: '', course: '', speed: '0', rpm: '', engTP: '',
             waterLog: vals.shWLog, groundLog: vals.shGLog, fuelUsed: vals.shFuelUsed,
             notes: builtNotes, entryType: 'shutdown', engineHoursEnd: vals.shEh,
             fuelEndPercentR: vals.shFuelR, fuelEndPercentC: vals.shFuelC, shutdownNotes: vals.shNotes
-          });
+          };
+          markLogEntryDirty(newEntry, p);
+          p.entries.unshift(newEntry);
         }
 								savePassages(); requestScrollToNewestLogEntry(); renderLogEntries(); refreshHomePassageList(); updatePassageHeader(); updateLogSummary();
 								
@@ -7248,6 +9344,7 @@ function openSimpleSpecialEntryDialog(p, entry) {
       const vals = getDialogFieldValues(['spTime','spNotes']);
       entry.time = normalizeEntryTimeInput(vals.spTime, entry.time, (p.plan?.date || ''));
       entry.notes = vals.spNotes;
+      markLogEntryDirty(entry, p);
       savePassages(); renderLogEntries(); refreshHomePassageList();
     }
   });
@@ -7291,6 +9388,7 @@ function addSpecialEntry(noteText, notesOverride = null) {
     notes: (notesOverride !== null ? notesOverride : (noteText || ""))
   };
 
+  markLogEntryDirty(entry, p);
   p.entries.unshift(entry);
   savePassages();
   requestScrollToNewestLogEntry();
@@ -7378,7 +9476,7 @@ function saveFuelManagementSettings(settings){
 }
 
 function getAllFuelRelevantEntries(){
-  return passages.flatMap(p => (Array.isArray(p.entries) ? p.entries : []).map(entry => ({ passage:p, entry })))
+  return passages.flatMap(p => activeLogEntries(p).map(entry => ({ passage:p, entry })))
     .filter(({ entry }) => entry && (entry.time || entry.refuel || entry.fuelUsed))
     .sort((a, b) => String(a.entry.time || "").localeCompare(String(b.entry.time || "")));
 }
@@ -7543,7 +9641,7 @@ async function addWaypointReachedEntry(p){
         const extraNotes = String(vals.wpReachedNotes || "").trim();
         const notes = extraNotes ? `WP reached: ${waypointName}\n${extraNotes}` : `WP reached: ${waypointName}`;
 
-        p.entries.unshift({
+        const newEntry = {
           id: newId("e"),
           time: entryTime,
           leg: legIdx,
@@ -7564,7 +9662,9 @@ async function addWaypointReachedEntry(p){
             waypointIndex: selected.waypointIndex,
             ata
           }
-        });
+        };
+        markLogEntryDirty(newEntry, p);
+        p.entries.unshift(newEntry);
 
         savePassages();
         requestScrollToNewestLogEntry();
@@ -7608,6 +9708,7 @@ async function addLogEntry(){
   const saved = await openManualEntryDialog(entry, { isNew: true, passage: p });
   if (!saved) return;
 
+  markLogEntryDirty(entry, p);
   p.entries.unshift(entry);
   savePassages();
   requestScrollToNewestLogEntry();
@@ -7793,12 +9894,12 @@ function attachSwipeToRow(tr, entryId) {
 function deleteLogEntryById(entryId) {
   const p = getCurrentPassage();
   if (!p) return;
-  const idx = p.entries.findIndex(e => e.id === entryId);
+  const idx = p.entries.findIndex(e => e.id === entryId && !isDeletedLogEntry(e));
   if (idx < 0) return;
 
   const deleted = p.entries[idx];
 
-  const ok = confirm("Delete this log entry?");
+  const ok = confirm("Delete this log entry?\n\nIt will be hidden from the log but kept in the backup data so it can be recovered later.");
   if (!ok) return;
 
   hideAllSwipeDeleteButtons();
@@ -7807,7 +9908,7 @@ function deleteLogEntryById(entryId) {
     el.style.removeProperty("--swipe-x");
   });
 
-  p.entries.splice(idx, 1);
+  markLogEntryDirty(deleted, p, { deleted: true });
 
   // If a Shutdown entry was deleted, we only clear the passage "finish" flag
   // when that deleted shutdown belonged to the FINAL leg.
@@ -7826,7 +9927,7 @@ function deleteLogEntryById(entryId) {
 
   // Recompute special-entry flags so deleted items can be re-added (CL-076-2)
   if (!p.flags) p.flags = {};
-  const entries = p.entries || [];
+  const entries = activeLogEntries(p);
   const hasEngineStart = entries.some(e => typeof e.notes === 'string' && e.notes.toLowerCase().startsWith('engine start'));
   const hasSlip = entries.some(e => typeof e.notes === 'string' && e.notes.toLowerCase().startsWith('slipped lines'));
   const hasDock = entries.some(e => typeof e.notes === 'string' && (e.notes.toLowerCase().startsWith('alongside') || e.notes.toLowerCase().startsWith('docked')));
@@ -7850,6 +9951,7 @@ function handlePositionEdit(entry) {
     const result = parseAndFormatPositionInput(val.trim(), entry.lat, entry.lon);
     entry.lat = result.lat;
     entry.lon = result.lon;
+    markLogEntryDirty(entry, getCurrentPassage());
     savePassages();
     renderLogEntries();
   }
@@ -7863,6 +9965,7 @@ function handlePositionEdit(entry) {
     (pos) => {
       entry.lat = formatLatFromDecimal(pos.coords.latitude);
       entry.lon = formatLonFromDecimal(pos.coords.longitude);
+      markLogEntryDirty(entry, getCurrentPassage());
       savePassages();
       requestScrollToNewestLogEntry();
       renderLogEntries();
@@ -7930,14 +10033,15 @@ function renderLogEntries() {
   logEntriesContainer.innerHTML = "";
   const showLegSummaries = p ? getLegCount(p) > 1 : false;
     
-  if (!p || (p.entries?.length || 0) === 0) {
+  const visibleEntries = activeLogEntries(p);
+  if (!p || visibleEntries.length === 0) {
     logEmptyMessage.style.display = "block";
     logSummaryPanel.textContent = "";
     return;
   }
   logEmptyMessage.style.display = "none";
 
-  const entries = p.entries.slice().sort((a, b) => (a.time > b.time ? 1 : -1));
+  const entries = visibleEntries.slice().sort((a, b) => (a.time > b.time ? 1 : -1));
 
   entries.forEach(entry => {
     const tr = document.createElement("tr");
@@ -7967,11 +10071,16 @@ function renderLogEntries() {
 
     const tdNotes = document.createElement('td');
     tdNotes.className = 'log-display-cell log-notes-cell';
-    tdNotes.addEventListener('click', (ev) => { ev.stopPropagation(); openEntryDialog(entry); });
+    tdNotes.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      if (ev.target.closest("a")) return;
+      openEntryDialog(entry);
+    });
 
     const notesText = document.createElement('div');
     notesText.className = 'log-notes-display';
-    notesText.textContent = entry.notes || '—';
+    notesText.innerHTML = entry.notes ? linkifyNoteHtml(entry.notes) : '—';
+    activateNoteLinks(notesText);
     tdNotes.appendChild(notesText);
 
     const latStr = (entry.lat == null) ? "" : String(entry.lat);
@@ -8108,7 +10217,7 @@ function _fmtDurationFromMinutes(totalMinutes) {
 }
 
 function computeLegMetricsFromEntries(p, legIdx) {
-  const entries = Array.isArray(p?.entries) ? p.entries : [];
+  const entries = activeLogEntries(p);
   const legEntries = entries.filter(e => (e.leg ?? 0) === legIdx);
   const sorted = legEntries.slice().sort((a, b) => new Date(a.time || 0) - new Date(b.time || 0));
 
@@ -8166,7 +10275,7 @@ function computePassageLogSummary(p) {
     return { ehText: "–", fuelUsed: "–", fuelStart: "–", fuelEnd: "–", gLog: "–", durationText: "–" };
   }
 
-  const entries = Array.isArray(p.entries) ? p.entries : [];
+  const entries = activeLogEntries(p);
   const fuelStart = (p.plan && typeof p.plan.fuelStartPercent !== "undefined" && p.plan.fuelStartPercent !== null && p.plan.fuelStartPercent !== "")
     ? p.plan.fuelStartPercent
     : "–";
@@ -8231,7 +10340,7 @@ function computeLegLogSummary(p, legIdx) {
     return { ehText: "–", fuelUsed: "–", fuelStart: "–", fuelEnd: "–", gLog: "–", durationText: "–" };
   }
 
-  const entries = Array.isArray(p.entries) ? p.entries : [];
+  const entries = activeLogEntries(p);
   const legEntries = entries.filter(e => (e.leg ?? 0) === legIdx);
 
   const sorted = legEntries.slice().sort((a, b) => new Date(a.time || 0) - new Date(b.time || 0));
@@ -8329,7 +10438,7 @@ function loadPassageIntoUI() {
 // --- Create new passage -------------------------------------------
 
 homeNewPassageBtn.addEventListener("click", () => {
-  if (passages.length > 0) {
+  if (activePassages().length > 0) {
     const ok = confirm("Start a new passage? (Existing ones will remain in history.)");
     if (!ok) return;
   }
@@ -9120,10 +11229,11 @@ if (new URLSearchParams(location.search).has("reset")) {
 		try { injectSafetyEmergencySettingsBlock(); } catch (e) { console.warn('injectSafetyEmergencySettingsBlock failed', e); }
 		try { injectFuelManagementSettingsBlock(); } catch (e) { console.warn('injectFuelManagementSettingsBlock failed', e); }
 		try { setupSettingsCardToggles(); } catch (e) { console.warn('setupSettingsCardToggles failed', e); }
+  try { renderLocalSyncStatus(); } catch (e) { console.warn('renderLocalSyncStatus failed', e); }
 
   refreshHomePassageList();
 
-  if (!currentPassageId && passages.length > 0) currentPassageId = passages[0].id;
+  if (!currentPassageId && activePassages().length > 0) currentPassageId = getFirstActivePassage().id;
 
   loadPassageIntoUI();
   setupLogSplitDivider();

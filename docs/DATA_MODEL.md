@@ -1,6 +1,6 @@
 # STEELER Logbook Data Model
 
-This document records the local data shapes used by the v1.0.1 build. It began as the v0.11.5 baseline documentation and has been updated as the architecture foundation work added safety mirrors, modules, v0.20.x sea-use tweaks, and reusable Detailed Passage Plan templates.
+This document records the local data shapes used by the v1.2.0 sync-foundation build. It began as the v0.11.5 baseline documentation and has been updated as the architecture foundation work added safety mirrors, modules, v0.20.x sea-use tweaks, reusable Detailed Passage Plan templates, and the first offline-first sync preparation fields.
 
 The app is an offline-first browser PWA. User data is stored in `localStorage` as JSON strings, except for the theme value. Storage keys and data shapes must not be changed without an explicit migration plan and backup/restore testing.
 
@@ -15,6 +15,12 @@ The app is an offline-first browser PWA. User data is stored in `localStorage` a
 | `steeler_ec_settings_v1` | Legacy emergency contact settings | JSON legacy object; migrated into safety info when present |
 | `STEELER_ABBR_DB_V1` | Weather abbreviation database and user edits | JSON abbreviation database; flat and legacy grouped shapes are accepted |
 | `steeler_dpp_templates_v1` | Globally reusable Detailed Passage Plan templates | JSON `DppTemplateStore` object |
+| `steeler_dpp_waypoints_v1` | Globally reusable Detailed Passage Plan waypoints | JSON `DppWaypointStore` object |
+| `steeler_fuel_management_v1` | Fuel tank/reset settings | JSON fuel management object |
+| `steeler_log_split_ratio_v1` | Log/plan split layout preference | Plain string number |
+| `steeler_device_id_v1` | Local device/client identity for future sync | Plain string generated locally; not restored from data backups |
+| `steeler_sync_status_v1` | Local sync status summary | JSON object; records local changes, Worker checks, and one-way cloud backup status |
+| `steeler_sync_config_v1` | Staging sync connection settings | JSON object containing Worker URL and local token; not included in full data backups |
 
 ## Safety Mirror Keys
 
@@ -77,12 +83,22 @@ Stored inside `steeler_logbook_passages_v5`.
   entries: LogEntry[],
   finish: PassageFinish,
   createdAt: "2026-05-03T08:00:00.000Z",
+  updatedAt: "2026-05-03T08:00:00.000Z",
+  schemaVersion: 1,
+  lastModifiedDeviceId: "device_...",
+  deleted: false,
+  deletedAt: "",
+  syncDirty: true,
+  syncStatus: "pending",
+  dirtyAt: "2026-05-03T08:00:00.000Z",
 
   // Optional fields added by later workflows
   pob: "4",
   legEnds: PassageLegEnd[]
 }
 ```
+
+Deleted passages are soft-deleted for sync safety. The app hides passages where `deleted === true` from normal Home and Log views, but keeps them in `steeler_logbook_passages_v5` and full data backups so the deletion can sync to other devices.
 
 ## PassagePlan
 
@@ -184,6 +200,7 @@ Tide stations are planned data. Manual fields are the editable source of truth; 
   lat: 50.65,
   lon: -1.583333,
   distToNext: 12.4,
+  manualDistToNext: "",
   cogToNext: "187",
   plannedSpeed: "8.0",
   timeToNext: "01:33",
@@ -191,7 +208,7 @@ Tide stations are planned data. Manual fields are the editable source of truth; 
 }
 ```
 
-`distToNext`, `cogToNext`, `timeToNext`, and `fuelToNext` are recalculated from coordinates and planned speed. They are stored in passage data today, but should be treated as derived values.
+`distToNext`, `cogToNext`, `timeToNext`, and `fuelToNext` are recalculated from coordinates and planned speed. They are stored in passage data today, but should be treated as derived values. `manualDistToNext` can override the calculated distance for the leg starting at that waypoint, for example where a river route is longer than the straight-line waypoint distance.
 
 ## DppTemplateStore
 
@@ -219,6 +236,33 @@ Stored separately from passages in `steeler_dpp_templates_v1`. These templates a
 
 DPP templates include waypoint planned speeds plus the leg-specific `hazards`, `portsOfRefuge`, and `crewWelfare` fields. When a template is used, waypoint IDs are regenerated for the target leg so the saved template remains independent of the passage.
 
+## DppWaypointStore
+
+Stored separately from passages in `steeler_dpp_waypoints_v1`.
+
+```js
+{
+  version: 1,
+  updatedAt: "2026-05-04T12:00:00.000Z",
+  waypoints: DppSavedWaypoint[]
+}
+```
+
+## DppSavedWaypoint
+
+```js
+{
+  id: "dpp_wp_...",
+  name: "Needles Fairway",
+  coordsText: "50º39.000'N, 001º35.000'W",
+  lat: 50.65,
+  lon: -1.583333,
+  notes: "",
+  createdAt: "2026-05-04T12:00:00.000Z",
+  updatedAt: "2026-05-04T12:10:00.000Z"
+}
+```
+
 ## LogEntry
 
 ```js
@@ -238,6 +282,15 @@ DPP templates include waypoint planned speeds plus the leg-specific `hazards`, `
   fuelUsed: "",
   notes: "",
   entryType: "manual" | "engine-start" | "shutdown",
+  createdAt: "2026-05-03T08:30:00.000Z",
+  updatedAt: "2026-05-03T08:30:00.000Z",
+  schemaVersion: 1,
+  lastModifiedDeviceId: "device_...",
+  deleted: false,
+  deletedAt: "",
+  syncDirty: true,
+  syncStatus: "pending",
+  dirtyAt: "2026-05-03T08:30:00.000Z",
 
   // Engine-start/shutdown workflows may also store typed copies.
   fuelStartPercentR: "",
@@ -253,6 +306,10 @@ DPP templates include waypoint planned speeds plus the leg-specific `hazards`, `
 ```
 
 Manual log entries are the source of truth. Future live/NMEA values may prefill dialogs, but should not replace saved manual entries.
+
+Deleted log entries are soft-deleted for v1.2.0 sync safety. The app hides entries where `deleted === true` from normal log views, counts, summaries, CSV export and PDF/print export, but keeps them in `steeler_logbook_passages_v5` and full data backups. This lets a later sync stage distinguish "deleted intentionally" from "missing because this device is old".
+
+`syncDirty`, `syncStatus`, and `dirtyAt` are local sync-preparation fields. They mark records that have changed locally and need future sync processing. They do not currently contact a server.
 
 ## EngineStartEnvironment
 
@@ -304,7 +361,11 @@ Stored inside `steeler_logbook_ports_v1.data.all`.
   name: "Cherbourg",
   lat: 49.642,
   lon: -1.622,
-  commsPilotage: ""
+  commsPilotage: "",
+  createdAt: "2026-05-03T12:00:00.000Z",
+  updatedAt: "2026-05-03T12:00:00.000Z",
+  schemaVersion: 1,
+  lastModifiedDeviceId: "device_..."
 }
 ```
 
@@ -424,9 +485,153 @@ Stored in `STEELER_ABBR_DB_V1`. The current code accepts a legacy grouped shape 
 
 Rules are applied in stored order. User edits must be preserved when shipped defaults are merged.
 
+## FuelManagementSettings
+
+Stored in `steeler_fuel_management_v1`.
+
+```js
+{
+  tankCapacity: 2000,
+  resetAt: "2026-05-03T12:00",
+  resetLevel: 2000
+}
+```
+
 ## Backup Payloads
 
-Full logbook backup:
+Primary full data backup:
+
+```js
+{
+  format: "steeler-data-backup",
+  version: 1,
+  schemaVersion: 1,
+  exportedAt: "2026-05-03T12:00:00.000Z",
+  appVersion: "1.2.0-rc5",
+  exportedByDeviceId: "device_...",
+  data: {
+    passages: Passage[],
+    theme: "day",
+    knownPorts: {
+      all: Port[],
+      recent: string[]
+    },
+    safetyInfo: SafetyEmergencyInfo,
+    legacyEcSettings: EcSettings,
+    dppTemplates: DppTemplateStore,
+    dppWaypoints: DppWaypointStore,
+    weatherAbbreviations: WeatherAbbreviationDb,
+    fuelManagement: FuelManagementSettings,
+    settings: {
+      logSplitRatio: "42"
+    },
+    localSyncStatus: {
+      version: 1,
+      deviceId: "device_...",
+      syncEnabled: false,
+      status: "local-pending",
+      lastLocalChangeAt: "2026-05-03T12:00:00.000Z",
+      lastSyncAt: "",
+      lastSyncError: "",
+      pendingLocalChanges: 4
+    }
+  }
+}
+```
+
+The primary data backup is the preferred v1.2.0 archive/restore format. It includes all local STEELER data needed for a full-device restore. `localSyncStatus` is included for diagnostics, but restore does not replace the destination device's `steeler_device_id_v1` or use the backup's sync status as a cloud authority.
+
+When the manual Settings action sends a cloud backup, the app wraps this same payload in a sync Worker record:
+
+```js
+{
+  recordType: "cloud-backup",
+  payload: {
+    format: "steeler-cloud-backup-record",
+    version: 1,
+    createdAt: "2026-05-03T12:00:00.000Z",
+    appVersion: "1.2.0",
+    deviceId: "device_...",
+    backup: SteelerDataBackup
+  }
+}
+```
+
+This is an archive copy only. It does not pull records back from Cloudflare and does not merge or overwrite local data.
+
+The read-only cloud backup list is returned by `/v1/backups` and contains summary fields only:
+
+```js
+{
+  recordId: "cloud_backup_...",
+  createdAt: "2026-05-03T12:00:00.000Z",
+  appVersion: "1.2.0",
+  deviceId: "device_...",
+  passageCount: 4,
+  serverUpdatedAt: "2026-05-03 12:00:01",
+  serverRevision: 12
+}
+```
+
+This list does not include the full backup JSON and is not used for restore.
+
+The selected cloud backup download is returned by `/v1/backups/{recordId}`:
+
+```js
+{
+  ok: true,
+  recordId: "cloud_backup_...",
+  backup: SteelerDataBackup,
+  summary: {
+    createdAt: "2026-05-03T12:00:00.000Z",
+    appVersion: "1.2.0",
+    deviceId: "device_...",
+    serverUpdatedAt: "2026-05-03 12:00:01",
+    serverRevision: 12
+  }
+}
+```
+
+The app writes `backup` to a downloaded JSON file when Download Backup is used. Restore Backup uses the same response, downloads a local safety backup first, requires two confirmations, and then applies `backup` through the normal `steeler-data-backup` restore path. The destination device keeps its own `steeler_device_id_v1`.
+
+## Sync Records
+
+Manual Sync Preview builds local sync records, but does not upload or apply them yet. These records are intended to cover all local STEELER data:
+
+```js
+{
+  recordId: "passage:p_...",
+  recordType: "passage",
+  schemaVersion: 1,
+  clientUpdatedAt: "2026-05-03T12:00:00.000Z",
+  lastChangedDeviceId: "device_...",
+  deleted: false,
+  payload: {
+    format: "steeler-sync-record",
+    version: 1,
+    appVersion: "1.2.0",
+    recordType: "passage",
+    updatedAt: "2026-05-03T12:00:00.000Z",
+    data: Passage
+  }
+}
+```
+
+Global record ids currently include `global:ports`, `global:safety-info`, `global:legacy-ec-settings`, `global:dpp-templates`, `global:dpp-waypoints`, `global:weather-abbreviations`, `global:fuel-management`, and `global:app-settings`.
+
+The Worker summary endpoint `/v1/records/summary` returns record metadata only. It is used to preview how many records are safe to send, safe to receive, or need review without moving the actual record payloads.
+
+A record needs review when the same record exists locally and in cloud, the timestamps differ, and the last-changed device ids differ. Manual send/receive leaves these records untouched.
+
+Review items are resolved one at a time. Choosing "Keep this device" posts the selected local sync record to `/v1/records/push`. Choosing "Use cloud" first downloads a safety backup, then applies only the selected cloud sync record locally.
+
+Full Sync combines the existing safe send and safe receive operations. It does not resolve needs-review records automatically.
+
+Send Sync Records posts selected local sync records to `/v1/records/push`. After the Worker accepts every selected record, local `syncDirty` flags are cleared for the accepted passages, log entries, and ports. This marks those local changes as sent, but does not receive or merge remote records.
+
+Receive Sync Records uses `/v1/records` to fetch full cloud records, filters them to the records shown in the Receive preview, downloads a local safety backup, and applies only those selected records. It can receive passages and the global record types listed above. It does not send local records.
+
+Legacy full logbook backup:
 
 ```js
 {
@@ -442,9 +647,9 @@ Full logbook backup:
 }
 ```
 
-`dppTemplates` is optional for backwards compatibility. Backups created before v1.0.1 do not include it and still restore normally. Restoring a full backup that contains `dppTemplates` replaces the current DPP template store; ports remain separate.
+`dppTemplates` and `dppWaypoints` are optional for backwards compatibility. Backups created before v1.0.1 do not include DPP templates and still restore normally. Restoring a legacy full logbook backup preserves current ports.
 
-Ports backup:
+Legacy ports backup:
 
 ```js
 {
@@ -465,10 +670,11 @@ DPP Templates backup:
 ```js
 {
   format: "steeler-dpp-templates-backup",
-  version: 1,
+  version: 2,
   exportedAt: "2026-05-03T12:00:00.000Z",
   data: {
-    dppTemplates: DppTemplateStore
+    dppTemplates: DppTemplateStore,
+    dppWaypoints: DppWaypointStore
   }
 }
 ```
