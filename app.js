@@ -12,7 +12,7 @@ const SYNC_STATUS_KEY = "steeler_sync_status_v1";
 const SYNC_CONFIG_KEY = "steeler_sync_config_v1";
 const SYNC_RECORD_META_KEY = "steeler_sync_record_meta_v1";
 
-const APP_VERSION = "1.2.2";
+const APP_VERSION = "1.2.3";
 const LOCAL_DATA_SCHEMA_VERSION = 1;
 const DATA_BACKUP_FORMAT = "steeler-data-backup";
 const DEFAULT_SYNC_WORKER_URL = "https://steeler-logbook-sync.bill-merry-52f.workers.dev";
@@ -809,10 +809,23 @@ function compareLocalAndRemoteSyncRecords(localRecords, remoteRecords){
   };
 }
 
+function passageSyncRecordLabel(record){
+  const id = String(record?.recordId || "").replace(/^passage:/, "");
+  const passage = record?.payload?.data || {};
+  const plan = passage?.plan || {};
+  const from = String(plan.from || "").trim();
+  const to = String(plan.to || "").trim();
+  const date = String(passage.date || plan.date || "").trim();
+  const route = from && to ? `${from} -> ${to}` : from || to || "";
+  if (route && date) return `${route} (${date})`;
+  if (route) return route;
+  return id ? `Passage ${id}` : "Passage";
+}
+
 function syncRecordLabel(record){
   const id = String(record?.recordId || "");
   const type = String(record?.recordType || (id.startsWith("passage:") ? "passage" : id.replace(/^global:/, "")) || "record");
-  if (type === "passage") return id.replace(/^passage:/, "Passage ");
+  if (type === "passage") return passageSyncRecordLabel(record);
   return type.replace(/-/g, " ").replace(/\b\w/g, (ch) => ch.toUpperCase());
 }
 
@@ -934,6 +947,14 @@ function syncRecordDetail(item){
   const local = item?.local || item?.record || null;
   const remote = item?.remote || null;
   const recordType = String(local?.recordType || remote?.recordType || "");
+  if (recordType === "passage") {
+    const localDays = local?.payload?.data?.plan?.dailySummaries;
+    const remoteDays = remote?.payload?.data?.plan?.dailySummaries;
+    const parts = [];
+    if (Array.isArray(localDays)) parts.push(`this device Daily Summary rows: ${localDays.length}`);
+    if (Array.isArray(remoteDays)) parts.push(`cloud Daily Summary rows: ${remoteDays.length}`);
+    return parts.join("; ");
+  }
   if (recordType === "ports") return summarisePortsDifference(local, remote);
   if (recordType === "dpp-templates") {
     return summariseNamedListDifference("DPP templates", local?.payload?.data?.templates, remote?.payload?.data?.templates);
