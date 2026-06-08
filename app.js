@@ -12,7 +12,7 @@ const SYNC_STATUS_KEY = "steeler_sync_status_v1";
 const SYNC_CONFIG_KEY = "steeler_sync_config_v1";
 const SYNC_RECORD_META_KEY = "steeler_sync_record_meta_v1";
 
-const APP_VERSION = "1.2.1";
+const APP_VERSION = "1.2.2";
 const LOCAL_DATA_SCHEMA_VERSION = 1;
 const DATA_BACKUP_FORMAT = "steeler-data-backup";
 const DEFAULT_SYNC_WORKER_URL = "https://steeler-logbook-sync.bill-merry-52f.workers.dev";
@@ -451,8 +451,7 @@ function latestPassageTimestamp(p){
     entry?.updatedAt,
     entry?.createdAt,
     entry?.dirtyAt,
-    entry?.deletedAt,
-    entry?.time
+    entry?.deletedAt
   ]);
   return latestTimestampFromValues([
     p?.updatedAt,
@@ -625,6 +624,55 @@ function markReceivedRecordClean(record){
   return record;
 }
 
+function cloneDailySummaries(days){
+  return (Array.isArray(days) ? days : []).map((day) => ({ ...day }));
+}
+
+function dailySummaryContentScore(days){
+  return (Array.isArray(days) ? days : []).reduce((score, day) => {
+    const date = String(day?.date || "").trim();
+    const fee = String(day?.fee || "").trim();
+    const notes = String(day?.notes || "").trim();
+    return score + (date ? 1 : 0) + (fee ? 2 : 0) + (notes ? 3 + Math.min(notes.length, 200) : 0);
+  }, 0);
+}
+
+function localDailySummariesAreRicher(localDailySummaries, remoteDailySummaries){
+  if (!localDailySummaries.length) return false;
+  if (!remoteDailySummaries.length) return true;
+  return dailySummaryContentScore(localDailySummaries) > dailySummaryContentScore(remoteDailySummaries)
+    && localDailySummaries.length >= remoteDailySummaries.length;
+}
+
+function mergeReceivedPassageWithLocal(remotePassage, localPassage){
+  if (!remotePassage || typeof remotePassage !== "object") return remotePassage;
+  if (!localPassage || typeof localPassage !== "object") return remotePassage;
+
+  const merged = {
+    ...remotePassage,
+    plan: {
+      ...(remotePassage.plan || {})
+    }
+  };
+  const remoteDailySummaries = Array.isArray(remotePassage.plan?.dailySummaries)
+    ? remotePassage.plan.dailySummaries
+    : [];
+  const localDailySummaries = Array.isArray(localPassage.plan?.dailySummaries)
+    ? localPassage.plan.dailySummaries
+    : [];
+
+  if (localDailySummariesAreRicher(localDailySummaries, remoteDailySummaries)) {
+    const changedAt = nowIso();
+    merged.plan.dailySummaries = cloneDailySummaries(localDailySummaries);
+    merged.updatedAt = changedAt;
+    merged.dirtyAt = changedAt;
+    merged.syncDirty = true;
+    merged.syncStatus = "dirty";
+  }
+
+  return merged;
+}
+
 function applySyncRecord(record){
   const type = String(record?.recordType || "");
   const data = record?.payload?.data;
@@ -635,7 +683,7 @@ function applySyncRecord(record){
   if (type === "passage") {
     if (!data || typeof data !== "object" || !data.id) return false;
     const idx = (Array.isArray(passages) ? passages : []).findIndex((p) => p?.id === data.id);
-    if (idx >= 0) passages[idx] = data;
+    if (idx >= 0) passages[idx] = mergeReceivedPassageWithLocal(data, passages[idx]);
     else passages.unshift(data);
     normalisePassagesForSync(passages);
     saveLocalStorageItem(STORAGE_KEY, JSON.stringify(passages), "passages");
