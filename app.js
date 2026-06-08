@@ -12,7 +12,7 @@ const SYNC_STATUS_KEY = "steeler_sync_status_v1";
 const SYNC_CONFIG_KEY = "steeler_sync_config_v1";
 const SYNC_RECORD_META_KEY = "steeler_sync_record_meta_v1";
 
-const APP_VERSION = "1.2.3";
+const APP_VERSION = "1.2.4";
 const LOCAL_DATA_SCHEMA_VERSION = 1;
 const DATA_BACKUP_FORMAT = "steeler-data-backup";
 const DEFAULT_SYNC_WORKER_URL = "https://steeler-logbook-sync.bill-merry-52f.workers.dev";
@@ -975,11 +975,11 @@ function renderSyncPreview(comparison, remoteRevision){
   if (!el) return;
   const uploadItems = comparison.wouldUpload.slice(0, 8).map((item) => {
     const detail = syncRecordDetail(item);
-    return `<li>${escapeHtml(syncRecordLabel(item.record))} <span>${escapeHtml(item.reason)}</span>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}</li>`;
+    return `<li>${escapeHtml(syncRecordLabel(item.local || item.record))} <span>${escapeHtml(item.reason)}</span>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}</li>`;
   }).join("");
   const downloadItems = comparison.wouldDownload.slice(0, 8).map((item) => {
     const detail = syncRecordDetail(item);
-    return `<li>${escapeHtml(syncRecordLabel(item.record))} <span>${escapeHtml(item.reason)}</span>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}</li>`;
+    return `<li>${escapeHtml(syncRecordLabel(item.local || item.record))} <span>${escapeHtml(item.reason)}</span>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}</li>`;
   }).join("");
   const conflictItems = (comparison.conflicts || []).slice(0, 8).map((item) => {
     const recordId = item.local?.recordId || item.remote?.recordId || "";
