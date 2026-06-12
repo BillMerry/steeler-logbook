@@ -12,7 +12,7 @@ const SYNC_STATUS_KEY = "steeler_sync_status_v1";
 const SYNC_CONFIG_KEY = "steeler_sync_config_v1";
 const SYNC_RECORD_META_KEY = "steeler_sync_record_meta_v1";
 
-const APP_VERSION = "1.2.4";
+const APP_VERSION = "1.2.5";
 const LOCAL_DATA_SCHEMA_VERSION = 1;
 const DATA_BACKUP_FORMAT = "steeler-data-backup";
 const DEFAULT_SYNC_WORKER_URL = "https://steeler-logbook-sync.bill-merry-52f.workers.dev";
@@ -3662,7 +3662,9 @@ function passageDateToday(p = null) {
 }
 
 function passageDateTimeNow(p = null) {
-  return localDateTimeInputValue(new Date(), getPassageTimeZone(p));
+  const timeNow = timeOnlyFromIso(localDateTimeInputValue(new Date(), getPassageTimeZone(p)));
+  const fallbackDate = getPassageLogDate(p) || passageDateToday(p);
+  return normalizeEntryTimeInput(timeNow, "", fallbackDate);
 }
 
 function escapeHtml(str) {
@@ -5526,6 +5528,33 @@ function ensureEntries(p){
   if(!Array.isArray(p.entries)) p.entries = [];
 }
 
+function getPassageLogDate(p) {
+  return String(p?.plan?.date || p?.createdAt || "").slice(0, 10);
+}
+
+function getLogEntrySortKey(p, entry) {
+  const raw = String(entry?.time || "").trim();
+  if (!raw) return "";
+  const passageDate = getPassageLogDate(p);
+  const timeOnly = timeOnlyFromIso(raw);
+  if (passageDate && /^\d{2}:\d{2}$/.test(timeOnly)) return `${passageDate}T${timeOnly}`;
+  return raw;
+}
+
+function compareLogEntriesForPassage(p) {
+  return (a, b) => {
+    const byTime = getLogEntrySortKey(p, a).localeCompare(getLogEntrySortKey(p, b));
+    if (byTime !== 0) return byTime;
+    return String(a?.id || "").localeCompare(String(b?.id || ""));
+  };
+}
+
+function logEntrySortDate(p, entry) {
+  const key = getLogEntrySortKey(p, entry);
+  const d = key ? new Date(key) : new Date(0);
+  return Number.isNaN(d.getTime()) ? new Date(0) : d;
+}
+
 // Simple unique id generator (used for log entries, etc.)
 function newId(prefix = 'e') {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
@@ -5570,7 +5599,7 @@ function ensureEntryLegs(p) {
   if (!p || !Array.isArray(p.entries)) return;
   const entries = activeLogEntries(p);
   if (entries.every(e => typeof e.leg === "number")) return;
-  const sorted = entries.slice().sort((a, b) => String(a.time || "").localeCompare(String(b.time || "")));
+  const sorted = entries.slice().sort(compareLogEntriesForPassage(p));
   let leg = 0;
   for (const e of sorted) {
     if (typeof e.leg !== "number") e.leg = leg;
@@ -9454,13 +9483,11 @@ function addSpecialEntry(noteText, notesOverride = null) {
   ensureFlags(p);
   if (passageIsShutdown(p)) return alert("Shutdown already recorded – no further log entries allowed.");
 
-  const now = new Date();
-  const timeStr = localDateTimeInputValue(now, getPassageTimeZone(p));
+  const timeStr = passageDateTimeNow(p);
 
   const entry = {
     id: "e_" + Date.now(),
     time: timeStr,
-    leg: getCurrentLegIndex(p),
     leg: getCurrentLegIndex(p),
     lat: "",
     lon: "",
@@ -9565,7 +9592,7 @@ function saveFuelManagementSettings(settings){
 function getAllFuelRelevantEntries(){
   return passages.flatMap(p => activeLogEntries(p).map(entry => ({ passage:p, entry })))
     .filter(({ entry }) => entry && (entry.time || entry.refuel || entry.fuelUsed))
-    .sort((a, b) => String(a.entry.time || "").localeCompare(String(b.entry.time || "")));
+    .sort((a, b) => getLogEntrySortKey(a.passage, a.entry).localeCompare(getLogEntrySortKey(b.passage, b.entry)));
 }
 
 function computeFuelManagementStats({ beforeTime = "", excludeEntryId = "" } = {}){
@@ -9812,12 +9839,12 @@ function addDockEntry() {
   ensureFlags(p);
   if (passageIsShutdown(p)) return alert("Shutdown already recorded – no further log entries allowed.");
 
-  const now = new Date();
-  const timeStr = localDateTimeInputValue(now, getPassageTimeZone(p));
+  const timeStr = passageDateTimeNow(p);
 
   const entry = {
     id: "e_" + Date.now(),
     time: timeStr,
+    leg: getCurrentLegIndex(p),
     lat: "",
     lon: "",
     course: "",
@@ -10128,7 +10155,7 @@ function renderLogEntries() {
   }
   logEmptyMessage.style.display = "none";
 
-  const entries = visibleEntries.slice().sort((a, b) => (a.time > b.time ? 1 : -1));
+  const entries = visibleEntries.slice().sort(compareLogEntriesForPassage(p));
 
   entries.forEach(entry => {
     const tr = document.createElement("tr");
@@ -10306,7 +10333,7 @@ function _fmtDurationFromMinutes(totalMinutes) {
 function computeLegMetricsFromEntries(p, legIdx) {
   const entries = activeLogEntries(p);
   const legEntries = entries.filter(e => (e.leg ?? 0) === legIdx);
-  const sorted = legEntries.slice().sort((a, b) => new Date(a.time || 0) - new Date(b.time || 0));
+  const sorted = legEntries.slice().sort(compareLogEntriesForPassage(p));
 
   // Fuel used: last numeric in this leg
   let fuelUsed = null;
@@ -10329,19 +10356,20 @@ function computeLegMetricsFromEntries(p, legIdx) {
   const slipEntry = sorted.find(e => typeof e.notes === 'string' && e.notes.toLowerCase().startsWith('slipped lines'));
   let endEntry = null;
   if (slipEntry && slipEntry.time) {
-    endEntry = sorted.find(e => {
-      if (!e.time || e.time <= slipEntry.time || typeof e.notes !== 'string') return false;
+    const slipIdx = sorted.indexOf(slipEntry);
+    endEntry = sorted.slice(slipIdx + 1).find(e => {
+      if (!e.time || typeof e.notes !== 'string') return false;
       const note = e.notes.toLowerCase();
       return note.startsWith('alongside') || note.startsWith('docked') || note.startsWith('shutdown');
     });
   }
-  const tStart = slipEntry?.time ? new Date(slipEntry.time) : null;
-  const tEnd = endEntry?.time ? new Date(endEntry.time) : (tStart ? new Date() : null);
+  const tStart = slipEntry?.time ? logEntrySortDate(p, slipEntry) : null;
+  const tEnd = endEntry?.time ? logEntrySortDate(p, endEntry) : (tStart ? new Date() : null);
   if (tStart && tEnd && !isNaN(tStart) && !isNaN(tEnd)) {
     const ms = tEnd - tStart;
     if (!isNaN(ms) && ms > 0) durationMinutes = Math.round(ms / 60000);
   } else {
-    const times = sorted.map(e => e.time).filter(Boolean).map(t => new Date(t)).filter(d => !isNaN(d));
+    const times = sorted.map(e => logEntrySortDate(p, e)).filter(d => !isNaN(d));
     if (times.length >= 2) {
       const min = times.reduce((a, b) => (a < b ? a : b));
       const max = times.reduce((a, b) => (a > b ? a : b));
@@ -10376,7 +10404,7 @@ function computePassageLogSummary(p) {
 
   const sorted = entries
     .slice()
-    .sort((a, b) => new Date(a.time || 0) - new Date(b.time || 0));
+    .sort(compareLogEntriesForPassage(p));
 
   // Engine hours used: prefer plan/finish snapshot, else fall back to any per-entry EH (legacy)
   const planEhStart = (p.plan && p.plan.engineHoursStart !== undefined && p.plan.engineHoursStart !== null && p.plan.engineHoursStart !== "") ? `${p.plan.engineHoursStart}` : null;
@@ -10430,7 +10458,7 @@ function computeLegLogSummary(p, legIdx) {
   const entries = activeLogEntries(p);
   const legEntries = entries.filter(e => (e.leg ?? 0) === legIdx);
 
-  const sorted = legEntries.slice().sort((a, b) => new Date(a.time || 0) - new Date(b.time || 0));
+  const sorted = legEntries.slice().sort(compareLogEntriesForPassage(p));
   const m = computeLegMetricsFromEntries(p, legIdx);
   const fuelUsed = (m.fuelUsed === null) ? "–" : _fmt1(m.fuelUsed);
   const nmG = (m.nmG === null) ? "–" : _fmt1(m.nmG);
