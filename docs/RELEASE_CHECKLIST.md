@@ -62,20 +62,19 @@ Test from a clean browser profile or an iPad where possible:
 - Edit a Detailed Passage Plan template in Settings and confirm applying it to a passage uses the edited waypoints, speeds and notes.
 - Confirm the destination device keeps its own `steeler_device_id_v1` after restoring a data backup.
 - Delete a log entry and confirm it disappears from normal Log view, CSV export and PDF/print export while remaining present in the full data backup with `deleted: true`.
-- Delete a passage on one device, run Full Sync on both devices, and confirm the passage stays deleted rather than reappearing from cloud.
-- Confirm Settings > Data & Backup shows local sync status, pending local changes, recoverable deleted entries, last local change time and a device ID.
-- Enter the sync Worker URL/token, tap Check Sync, and confirm it reports Worker OK without changing passage data.
-- Tap Preview Sync and confirm it reports local/cloud sync-record counts plus safe-send, safe-receive, and needs-review counts without uploading, downloading into the app, restoring, merging, or changing local passage data.
-- Edit one shared settings record, such as Ports, DPP templates, weather abbreviations or fuel settings, and confirm Preview Sync shows a useful summary of what changed.
+- Delete a passage on one device, run Sync Now on both devices, and confirm the chosen complete copy keeps the passage deleted rather than resurrecting it unexpectedly.
+- Set a friendly device name on each device, such as `Bill's MacBook Pro` and `STEELER iPad`, then confirm Settings > Data & Backup shows a plain cloud sync status and keeps device/connection details inside Connection settings.
+- Enter the sync Worker URL/token if needed, tap Check Cloud, and confirm it reports the current full-data cloud copy without uploading, downloading, restoring, merging, or changing local data.
+- Tap Sync Now on a device that already matches cloud and confirm it simply reports that the device is synced, without asking to replace cloud data.
+- Tap Sync Now on a device with local changes and no newer cloud copy and confirm it offers to save this device's latest changes to cloud.
+- Edit one shared setting, such as Ports, DPP templates, weather abbreviations or fuel settings, tap Sync Now, and confirm the full-data cloud copy now includes that change.
 - Add a URL to a log note or DPP note and confirm it displays as a clickable link.
 - Override a DPP leg distance and confirm the total distance/time/fuel use the manual NM value.
-- Confirm Advanced sync tools can be expanded and contain Check Sync, one-way Send/Receive, and cloud backup controls.
-- For one needs-review item, choose either Keep this device or Use cloud. Confirm only that one item is resolved and the other needs-review items are left alone. If using cloud, confirm a safety backup downloads first.
-- Tap Full Sync and confirm it sends only safe-send records, receives only safe-receive records, downloads a safety backup before receiving, refreshes the preview, and leaves needs-review records untouched.
-- Tap Send Sync Records, confirm the warning, and confirm safe sync records upload while any needs-review records are left untouched.
-- Tap Preview Sync again and confirm it reports no records needing upload or receive.
-- On another device, tap Preview Sync, then Receive Sync Records. Confirm a safety backup downloads first, local records are not sent, needs-review records are left untouched, and only safe-receive records are applied.
-- Tap Send Backup to Cloud, confirm the warning, and confirm it reports a server revision without pulling, merging, restoring, or changing local passage data.
+- Add positive and negative tide/current values to DPP rows and confirm SOG/time changes while fuel burn remains based on STW over the derived elapsed time.
+- On another device that has not seen the latest cloud revision, tap Sync Now and confirm the app says which named device changed the cloud copy and offers Keep This Device, Use Cloud Copy, and Cancel.
+- Choose Keep This Device and confirm this device's complete data replaces the current cloud copy while the previous cloud copy appears in Recovery backups.
+- Repeat the conflict path and choose Use Cloud Copy. Confirm a local safety backup downloads first, the full cloud copy is restored, and this device keeps its own `steeler_device_id_v1`.
+- Confirm Recovery backups can be expanded and contain recent cloud backup controls only, without per-record send/receive tools.
 - Tap Refresh Cloud Backups and confirm it lists recent cloud backup summaries without downloading, restoring, or changing local passage data.
 - Tap Download Backup for a listed cloud backup and confirm a JSON file downloads without restoring or changing local passage data.
 - Tap Restore Backup for a listed cloud backup, confirm both warnings, confirm a safety backup downloads first, and confirm the selected backup restores while the device keeps its own `steeler_device_id_v1`.
@@ -94,6 +93,7 @@ Run these before a v1.0.0-facing release:
 - Create a new passage.
 - Add origin, destination, and transit ports.
 - Save plan and confirm tide stations, comms/pilotage, and plan summary.
+- Add Port Private Notes and confirm they remain visible in Port settings but do not copy into Plan Comms / Pilotage.
 - Add Detailed Passage Plan waypoints and recalculate.
 - Import a GPX file if available.
 - Add Engine Start, Slip, manual underway entry, Dock, and Shutdown entries.

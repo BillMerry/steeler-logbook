@@ -8,14 +8,18 @@ const DPP_WAYPOINTS_KEY = "steeler_dpp_waypoints_v1";
 const FUEL_MANAGEMENT_KEY = "steeler_fuel_management_v1";
 const LOG_SPLIT_RATIO_KEY = "steeler_log_split_ratio_v1";
 const DEVICE_ID_KEY = "steeler_device_id_v1";
+const DEVICE_NAME_KEY = "steeler_device_name_v1";
 const SYNC_STATUS_KEY = "steeler_sync_status_v1";
 const SYNC_CONFIG_KEY = "steeler_sync_config_v1";
 const SYNC_RECORD_META_KEY = "steeler_sync_record_meta_v1";
 
-const APP_VERSION = "1.2.5";
+const APP_VERSION = "1.3.0";
 const LOCAL_DATA_SCHEMA_VERSION = 1;
 const DATA_BACKUP_FORMAT = "steeler-data-backup";
 const DEFAULT_SYNC_WORKER_URL = "https://steeler-logbook-sync.bill-merry-52f.workers.dev";
+const LEGACY_STAGING_SYNC_WORKER_URL = "https://steeler-logbook-sync-staging.bill-merry-52f.workers.dev";
+const FULL_DATA_SYNC_RECORD_ID = "global:full-data-sync";
+const FULL_DATA_SYNC_RECORD_TYPE = "full-data-sync";
 const DEFAULT_PASSAGE_TIME_ZONE = "Europe/London";
 const PASSAGE_TIME_ZONES = {
   "Europe/London": "BST",
@@ -112,6 +116,43 @@ function getOrCreateDeviceId(){
   return id;
 }
 
+function guessDeviceName(){
+  const ua = navigator.userAgent || "";
+  const platform = navigator.platform || "";
+  if (/iPad/i.test(ua) || (platform === "MacIntel" && navigator.maxTouchPoints > 1)) return "iPad";
+  if (/iPhone/i.test(ua)) return "iPhone";
+  if (/Mac/i.test(platform)) return "MacBook";
+  if (/Windows/i.test(platform)) return "Windows PC";
+  if (/Android/i.test(ua)) return "Android device";
+  return "This device";
+}
+
+function getDeviceName(){
+  try{
+    return String(storage.getItem(DEVICE_NAME_KEY) || "").trim() || guessDeviceName();
+  }catch{
+    return guessDeviceName();
+  }
+}
+
+function saveDeviceName(name){
+  const clean = String(name || "").trim().slice(0, 80);
+  try{
+    if (clean) storage.setItem(DEVICE_NAME_KEY, clean);
+    else storage.removeItem(DEVICE_NAME_KEY);
+  }catch(e){
+    console.warn("Could not save device name", e);
+  }
+  return getDeviceName();
+}
+
+function displayDeviceName(name, id = ""){
+  const cleanName = String(name || "").trim();
+  if (cleanName) return cleanName;
+  const cleanId = String(id || "").trim();
+  return cleanId ? cleanId.slice(0, 18) : "Unknown";
+}
+
 function loadSyncConfig(){
   const fallback = {
     version: 1,
@@ -124,11 +165,12 @@ function loadSyncConfig(){
     fallback,
     value => value && typeof value === "object" && !Array.isArray(value)
   );
+  const cleanWorkerUrl = String(stored?.workerUrl || fallback.workerUrl).trim().replace(/\/+$/g, "");
   return {
     ...fallback,
     ...stored,
     version: 1,
-    workerUrl: String(stored?.workerUrl || fallback.workerUrl).trim(),
+    workerUrl: cleanWorkerUrl === LEGACY_STAGING_SYNC_WORKER_URL ? DEFAULT_SYNC_WORKER_URL : cleanWorkerUrl,
     token: String(stored?.token || "")
   };
 }
@@ -240,7 +282,7 @@ function getLocalSyncSummary(){
   const deleted = countRecoverableDeletedEntries();
   if (status.pendingLocalChanges !== pending) {
     status.pendingLocalChanges = pending;
-    status.status = pending > 0 ? "local-pending" : "local-only";
+    status.status = pending > 0 ? "local-pending" : (status.status === "full-sync-ok" ? "full-sync-ok" : "local-only");
     saveLocalSyncStatus(status);
   }
   return {
@@ -264,52 +306,72 @@ function renderLocalSyncStatus(){
   if (!el) return;
   const summary = getLocalSyncSummary();
   const config = loadSyncConfig();
-  const shortDeviceId = String(summary.deviceId || "").slice(0, 18);
-  const lastCheck = summary.lastRemoteCheckAt || "";
-  const lastCloudBackup = summary.lastCloudBackupAt || "";
-  const remoteText = summary.lastRemoteStatus === "ok"
-    ? `OK${summary.lastRemoteRevision != null ? ` · rev ${summary.lastRemoteRevision}` : ""}`
-    : (summary.lastRemoteStatus === "error" ? "Error" : "Not checked");
+  const deviceName = getDeviceName();
+  const displayedCloudAt = summary.lastObservedFullSyncAt || summary.lastFullSyncAt || "";
+  const lastCloudDeviceName = summary.lastObservedFullSyncDeviceName || summary.lastFullSyncDeviceName || summary.lastCloudBackupDeviceName || "";
+  const lastCloudDeviceId = summary.lastObservedFullSyncDeviceId || summary.lastFullSyncDeviceId || summary.lastCloudBackupDeviceId || "";
+  const cloudDeviceText = displayDeviceName(lastCloudDeviceName, lastCloudDeviceId);
+  const lastSyncText = formatSyncStatusTime(summary.lastSyncAt);
+  const hasConnection = Boolean(config.workerUrl && config.token);
+  let statusText = "Ready to sync";
+  let statusDetail = "Sync Now checks cloud first, then updates only the copy that needs it.";
+  if (!hasConnection) {
+    statusText = "Cloud sync not set up";
+    statusDetail = "Open connection settings and enter the sync details to use cloud sync.";
+  } else if (summary.lastRemoteStatus === "error") {
+    statusText = "Sync needs attention";
+    statusDetail = summary.lastSyncError || "The last cloud check did not complete.";
+  } else if (summary.status === "full-sync-ok" && summary.pendingLocalChanges === 0) {
+    statusText = "Synced";
+    statusDetail = summary.lastSyncAt
+      ? `This device was last synced ${lastSyncText}.`
+      : "This device matches the latest cloud copy.";
+  } else if (summary.pendingLocalChanges > 0) {
+    statusText = "Ready to sync changes";
+    statusDetail = "Sync Now will check cloud first, then save this device's latest changes if it is safe to do so.";
+  } else if (displayedCloudAt) {
+    statusText = "Ready to sync";
+    statusDetail = `Latest cloud copy was saved ${formatSyncStatusTime(displayedCloudAt)}${cloudDeviceText ? ` by ${cloudDeviceText}` : ""}.`;
+  }
   el.innerHTML = `
-    <div class="sync-status-grid">
-      <div><span>Sync</span><strong>${escapeHtml(remoteText)}</strong></div>
-      <div><span>Pending local changes</span><strong>${summary.pendingLocalChanges}</strong></div>
-      <div><span>Recoverable deleted entries</span><strong>${summary.recoverableDeletedEntries}</strong></div>
-      <div><span>Last local change</span><strong>${escapeHtml(formatSyncStatusTime(summary.lastLocalChangeAt))}</strong></div>
-      <div><span>Last remote check</span><strong>${escapeHtml(formatSyncStatusTime(lastCheck))}</strong></div>
-      <div><span>Last cloud backup</span><strong>${escapeHtml(formatSyncStatusTime(lastCloudBackup))}</strong></div>
-      <div><span>Device ID</span><strong>${escapeHtml(shortDeviceId || "Creating...")}</strong></div>
+    <div class="sync-overview-card">
+      <span>Cloud sync</span>
+      <strong>${escapeHtml(statusText)}</strong>
+      <p>${escapeHtml(statusDetail)}</p>
     </div>
     <div class="sync-check-panel">
-      <label class="sync-check-field">
-        <span>Worker URL</span>
-        <input id="syncWorkerUrl" type="url" value="${escapeHtml(config.workerUrl)}" autocomplete="off" spellcheck="false">
-      </label>
-      <label class="sync-check-field">
-        <span>Sync token</span>
-        <input id="syncWorkerToken" type="password" value="${escapeHtml(config.token)}" autocomplete="off" spellcheck="false">
-      </label>
       <div class="st-action-row">
-        <button type="button" id="syncPreviewBtn" class="btn btn-secondary">Preview Sync</button>
-        <button type="button" id="syncFullBtn" class="btn">Full Sync</button>
+        <button type="button" id="syncPreviewBtn" class="btn btn-secondary">Check Cloud</button>
+        <button type="button" id="syncFullBtn" class="btn" data-sync-now-btn="1">Sync Now</button>
       </div>
       <details class="sync-advanced">
-        <summary>Advanced sync tools</summary>
+        <summary>Connection settings</summary>
+        <label class="sync-check-field">
+          <span>Device name</span>
+          <input id="syncDeviceName" type="text" value="${escapeHtml(deviceName)}" autocomplete="off" spellcheck="false" placeholder="Bill's MacBook Pro">
+        </label>
+        <label class="sync-check-field">
+          <span>Worker URL</span>
+          <input id="syncWorkerUrl" type="url" value="${escapeHtml(config.workerUrl)}" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="sync-check-field">
+          <span>Sync token</span>
+          <input id="syncWorkerToken" type="password" value="${escapeHtml(config.token)}" autocomplete="off" spellcheck="false">
+        </label>
+      </details>
+      <details class="sync-advanced">
+        <summary>Recovery backups</summary>
         <div class="st-action-row">
-          <button type="button" id="syncCheckStatusBtn" class="btn btn-secondary">Check Sync</button>
-          <button type="button" id="syncPushRecordsBtn" class="btn btn-secondary">Send Sync Records</button>
-          <button type="button" id="syncReceiveRecordsBtn" class="btn btn-secondary">Receive Sync Records</button>
-          <button type="button" id="syncSendBackupBtn" class="btn btn-secondary">Send Backup to Cloud</button>
           <button type="button" id="syncRefreshBackupsBtn" class="btn btn-secondary">Refresh Cloud Backups</button>
         </div>
       </details>
       <div id="syncPreviewResults" class="sync-preview-results">
-        <p class="hint">Preview Sync compares local data with cloud sync records. It does not upload, download, restore, merge or change data.</p>
+        <p class="hint">Cloud is treated as the main copy. Sync Now checks it first, then confirms before changing anything important.</p>
       </div>
       <div id="syncCloudBackups" class="sync-cloud-backups">
-        <p class="hint">Refresh Cloud Backups shows recent backup copies stored in Cloudflare. It does not download, restore, merge or change local data.</p>
+        <p class="hint">Recovery backups are kept when the cloud copy is replaced. They can be downloaded or restored manually.</p>
       </div>
-      <p id="syncCheckMessage" class="hint">${escapeHtml(summary.lastSyncError || "Check Sync tests the Worker. Send Backup uploads one backup copy only; it does not pull, merge or overwrite local data.")}</p>
+      <p id="syncCheckMessage" class="hint">${escapeHtml(summary.lastSyncError || "Ready to sync.")}</p>
     </div>
   `;
   bindSyncStatusControls();
@@ -321,16 +383,12 @@ function setSyncCheckMessage(message){
 }
 
 function bindSyncStatusControls(){
-  const checkBtn = document.getElementById("syncCheckStatusBtn");
-  if (checkBtn && checkBtn.dataset.bound !== "1") {
-    checkBtn.dataset.bound = "1";
-    checkBtn.addEventListener("click", checkSyncWorkerStatus);
-  }
-
-  const backupBtn = document.getElementById("syncSendBackupBtn");
-  if (backupBtn && backupBtn.dataset.bound !== "1") {
-    backupBtn.dataset.bound = "1";
-    backupBtn.addEventListener("click", sendCloudBackup);
+  const deviceNameInput = document.getElementById("syncDeviceName");
+  if (deviceNameInput && deviceNameInput.dataset.bound !== "1") {
+    deviceNameInput.dataset.bound = "1";
+    const saveName = () => saveDeviceName(deviceNameInput.value);
+    deviceNameInput.addEventListener("change", saveName);
+    deviceNameInput.addEventListener("blur", saveName);
   }
 
   const refreshBtn = document.getElementById("syncRefreshBackupsBtn");
@@ -342,34 +400,26 @@ function bindSyncStatusControls(){
   const previewBtn = document.getElementById("syncPreviewBtn");
   if (previewBtn && previewBtn.dataset.bound !== "1") {
     previewBtn.dataset.bound = "1";
-    previewBtn.addEventListener("click", previewManualSync);
+    previewBtn.addEventListener("click", checkFullDataCloudSync);
   }
 
   const fullBtn = document.getElementById("syncFullBtn");
   if (fullBtn && fullBtn.dataset.bound !== "1") {
     fullBtn.dataset.bound = "1";
-    fullBtn.addEventListener("click", fullManualSync);
+    fullBtn.addEventListener("click", runFullDataCloudSync);
   }
 
-  const pushBtn = document.getElementById("syncPushRecordsBtn");
-  if (pushBtn && pushBtn.dataset.bound !== "1") {
-    pushBtn.dataset.bound = "1";
-    pushBtn.addEventListener("click", pushManualSyncRecords);
-  }
-
-  const receiveBtn = document.getElementById("syncReceiveRecordsBtn");
-  if (receiveBtn && receiveBtn.dataset.bound !== "1") {
-    receiveBtn.dataset.bound = "1";
-    receiveBtn.addEventListener("click", receiveManualSyncRecords);
-  }
 }
 
 function getSavedSyncConnection(){
   const urlEl = document.getElementById("syncWorkerUrl");
   const tokenEl = document.getElementById("syncWorkerToken");
+  const deviceNameEl = document.getElementById("syncDeviceName");
+  if (deviceNameEl) saveDeviceName(deviceNameEl.value);
+  const currentConfig = loadSyncConfig();
   const config = saveSyncConfig({
-    workerUrl: urlEl?.value || DEFAULT_SYNC_WORKER_URL,
-    token: tokenEl?.value || ""
+    workerUrl: urlEl ? urlEl.value : currentConfig.workerUrl,
+    token: tokenEl ? tokenEl.value : currentConfig.token
   });
 
   if (!config.token) {
@@ -396,7 +446,7 @@ async function checkSyncWorkerStatus(){
   }
 
   if (btn) btn.disabled = true;
-  setSyncCheckMessage("Checking sync Worker...");
+  setSyncCheckMessage("Checking cloud Worker...");
   const checkedAt = nowIso();
 
   try{
@@ -508,6 +558,7 @@ function createSyncRecord(recordId, recordType, payload, timestamp, lastChangedD
     schemaVersion: LOCAL_DATA_SCHEMA_VERSION,
     clientUpdatedAt: cleanTimestamp,
     lastChangedDeviceId,
+    lastChangedDeviceName: getDeviceName(),
     deleted: payload?.deleted === true,
     payload: {
       format: "steeler-sync-record",
@@ -1038,6 +1089,450 @@ function setSyncConflictButtonsDisabled(disabled){
   document.querySelectorAll(".sync-conflict-choice-btn").forEach((btn) => {
     btn.disabled = disabled;
   });
+}
+
+function getFullDataBackupFromRecord(record){
+  const payload = record?.payload || {};
+  const backup = payload.backup || payload.data?.backup || null;
+  return backup && backup.format === DATA_BACKUP_FORMAT ? backup : null;
+}
+
+function createFullDataSyncRecord(backupPayload, timestamp = nowIso()){
+  const deviceId = getOrCreateDeviceId();
+  const deviceName = getDeviceName();
+  return {
+    recordId: FULL_DATA_SYNC_RECORD_ID,
+    recordType: FULL_DATA_SYNC_RECORD_TYPE,
+    schemaVersion: LOCAL_DATA_SCHEMA_VERSION,
+    clientUpdatedAt: timestamp,
+    lastChangedDeviceId: deviceId,
+    lastChangedDeviceName: deviceName,
+    deleted: false,
+    payload: {
+      format: "steeler-full-data-sync-record",
+      version: 1,
+      createdAt: timestamp,
+      appVersion: APP_VERSION,
+      deviceId,
+      deviceName,
+      backup: backupPayload
+    }
+  };
+}
+
+async function pushCloudSyncRecords(connection, records){
+  const cleanRecords = (Array.isArray(records) ? records : []).filter(Boolean);
+  if (!cleanRecords.length) return { accepted: [], serverRevision: null };
+  const res = await fetch(`${connection.baseUrl}/v1/records/push`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${connection.config.token}`
+    },
+    cache: "no-store",
+    body: JSON.stringify({
+      deviceId: getOrCreateDeviceId(),
+      deviceName: getDeviceName(),
+      records: cleanRecords
+    })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok !== true) {
+    throw new Error(getCloudResponseErrorMessage(res, data));
+  }
+  const accepted = Array.isArray(data.accepted) ? data.accepted : [];
+  const rejected = Array.isArray(data.rejected) ? data.rejected : [];
+  if (accepted.length !== cleanRecords.length || rejected.length) {
+    throw new Error(`Worker accepted ${accepted.length} of ${cleanRecords.length} records.`);
+  }
+  return { ...data, accepted };
+}
+
+function getCloudResponseErrorMessage(response, data = {}){
+  if (data && typeof data.error === "string" && data.error.trim()) return data.error.trim();
+  if (response?.status === 503) return "Cloud sync is temporarily unavailable. Please try again in a minute.";
+  if (response?.status === 504) return "Cloud sync took too long to respond. Please try again in a minute.";
+  if (response?.status === 401) return "The sync token was not accepted.";
+  if (response?.status === 404) return "The cloud sync service could not find that request.";
+  if (response?.status) return `Cloud sync returned ${response.status}.`;
+  return "Cloud sync did not respond.";
+}
+
+async function fetchCurrentFullDataCloudRecord(connection){
+  const res = await fetch(`${connection.baseUrl}/v1/records?since=0&limit=20&type=${encodeURIComponent(FULL_DATA_SYNC_RECORD_TYPE)}`, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${connection.config.token}`
+    },
+    cache: "no-store"
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok !== true) {
+    throw new Error(getCloudResponseErrorMessage(res, data));
+  }
+  const current = (Array.isArray(data.records) ? data.records : [])
+    .filter((record) => record.recordId === FULL_DATA_SYNC_RECORD_ID || record.recordType === FULL_DATA_SYNC_RECORD_TYPE)
+    .sort((a, b) => Number(b.serverRevision || 0) - Number(a.serverRevision || 0))[0] || null;
+  return {
+    record: current,
+    backup: getFullDataBackupFromRecord(current),
+    serverRevision: current?.serverRevision || data.serverRevision || 0
+  };
+}
+
+function describeFullDataCloudRecord(cloud){
+  const record = cloud?.record || null;
+  const backup = cloud?.backup || getFullDataBackupFromRecord(record);
+  const updatedAt = record?.clientUpdatedAt || record?.payload?.createdAt || backup?.exportedAt || "";
+  const deviceId = record?.lastChangedDeviceId || record?.payload?.deviceId || backup?.exportedByDeviceId || "";
+  const deviceName = record?.lastChangedDeviceName || record?.payload?.deviceName || backup?.exportedByDeviceName || "";
+  const passageCount = Array.isArray(backup?.data?.passages) ? backup.data.passages.length : 0;
+  return {
+    revision: Number(record?.serverRevision || cloud?.serverRevision || 0),
+    updatedAt,
+    deviceId,
+    deviceName,
+    displayDevice: displayDeviceName(deviceName, deviceId),
+    appVersion: record?.payload?.appVersion || backup?.appVersion || "",
+    passageCount,
+    text: record
+      ? `Cloud revision ${Number(record.serverRevision || cloud?.serverRevision || 0)} · ${formatSyncStatusTime(updatedAt)} · ${displayDeviceName(deviceName, deviceId)}`
+      : "No cloud copy found"
+  };
+}
+
+function removeBackupComparisonNoise(value){
+  if (Array.isArray(value)) return value.map(removeBackupComparisonNoise);
+  if (!value || typeof value !== "object") return value;
+  const clean = {};
+  Object.keys(value).sort().forEach((key) => {
+    if (key === "localSyncStatus" || key === "syncDirty" || key === "syncStatus" || key === "dirtyAt") return;
+    clean[key] = removeBackupComparisonNoise(value[key]);
+  });
+  return clean;
+}
+
+function comparableBackupData(backup){
+  return removeBackupComparisonNoise(cloneJsonSafe(backup?.data || {}, {}));
+}
+
+function fullDataBackupsMatch(localBackup, cloudBackup){
+  if (!localBackup || !cloudBackup) return false;
+  return stableComparableJson(comparableBackupData(localBackup)) === stableComparableJson(comparableBackupData(cloudBackup));
+}
+
+function renderFullDataCloudPreview(cloud, note = ""){
+  const el = document.getElementById("syncPreviewResults");
+  if (!el) return;
+  const summary = describeFullDataCloudRecord(cloud);
+  if (!cloud?.record) {
+    el.innerHTML = `
+      <div class="sync-preview-panel">
+        <div class="sync-overview-card">
+          <span>Cloud copy</span>
+          <strong>None yet</strong>
+          <p>${escapeHtml(note || "Sync Now will create the first cloud copy from this device.")}</p>
+        </div>
+      </div>
+    `;
+    return;
+  }
+  el.innerHTML = `
+    <div class="sync-preview-panel">
+      <div class="sync-status-grid">
+        <div><span>Last cloud save</span><strong>${escapeHtml(formatSyncStatusTime(summary.updatedAt))}</strong></div>
+        <div><span>Saved by</span><strong>${escapeHtml(summary.displayDevice)}</strong></div>
+        <div><span>Cloud data</span><strong>${summary.passageCount} passage${summary.passageCount === 1 ? "" : "s"}</strong></div>
+      </div>
+      <p class="hint">${escapeHtml(note || "Check only. No data was uploaded, downloaded or changed.")}</p>
+    </div>
+  `;
+}
+
+function saveFullDataCloudStatus(status, cloud, extra = {}){
+  const summary = describeFullDataCloudRecord(cloud);
+  return saveLocalSyncStatus({
+    status,
+    lastRemoteStatus: "ok",
+    lastRemoteCheckAt: extra.checkedAt || nowIso(),
+    lastRemoteRevision: summary.revision,
+    lastFullSyncRevision: summary.revision,
+    lastFullSyncAt: summary.updatedAt || extra.checkedAt || nowIso(),
+    lastFullSyncDeviceId: summary.deviceId || "",
+    lastFullSyncDeviceName: summary.deviceName || "",
+    lastFullSyncAppVersion: summary.appVersion || "",
+    pendingLocalChanges: countPendingLocalChanges(),
+    lastSyncError: "",
+    ...extra
+  });
+}
+
+function cloudCopyChangedSinceLastSync(cloud){
+  if (!cloud?.record) return false;
+  const status = loadLocalSyncStatus();
+  const lastSeen = Number(status.lastFullSyncRevision || 0);
+  const cloudRevision = Number(cloud.record.serverRevision || 0);
+  if (!lastSeen) return true;
+  return cloudRevision > lastSeen;
+}
+
+function clearAllLocalSyncDirty(){
+  let passagesChanged = false;
+  let portsChanged = false;
+  (Array.isArray(passages) ? passages : []).forEach((p) => {
+    if (!p || typeof p !== "object") return;
+    if (p.syncDirty || p.syncStatus || p.dirtyAt) {
+      p.syncDirty = false;
+      p.syncStatus = "synced";
+      p.dirtyAt = "";
+      passagesChanged = true;
+    }
+    (Array.isArray(p.entries) ? p.entries : []).forEach((entry) => {
+      if (!entry || typeof entry !== "object") return;
+      if (entry.syncDirty || entry.syncStatus || entry.dirtyAt) {
+        entry.syncDirty = false;
+        entry.syncStatus = "synced";
+        entry.dirtyAt = "";
+        passagesChanged = true;
+      }
+    });
+  });
+  (Array.isArray(knownPorts) ? knownPorts : []).forEach((port) => {
+    if (!port || typeof port !== "object") return;
+    if (port.syncDirty || port.syncStatus || port.dirtyAt) {
+      port.syncDirty = false;
+      port.syncStatus = "synced";
+      port.dirtyAt = "";
+      portsChanged = true;
+    }
+  });
+  if (passagesChanged) savePassages();
+  if (portsChanged) {
+    saveLocalStorageItem(PORTS_KEY, JSON.stringify({ all: knownPorts, recent: recentPorts }), "ports");
+    refreshPortUI();
+  }
+}
+
+function chooseFullSyncConflictAction(cloud){
+  const summary = describeFullDataCloudRecord(cloud);
+  return new Promise((resolve) => {
+    showModal({
+      title: "Cloud Copy Changed",
+      hideButtons: true,
+      bodyHtml: `
+        <p>Cloud was last updated by <strong>${escapeHtml(summary.displayDevice)}</strong>.</p>
+        <p>${escapeHtml(formatSyncStatusTime(summary.updatedAt))} · Revision ${summary.revision}</p>
+        <p>Choose which complete STEELER data copy to keep.</p>
+        <div class="st-action-row">
+          <button type="button" id="syncKeepThisDeviceBtn" class="btn">Keep This Device</button>
+          <button type="button" id="syncUseCloudCopyBtn" class="btn btn-secondary">Use Cloud Copy</button>
+          <button type="button" id="syncCancelChoiceBtn" class="btn btn-secondary">Cancel</button>
+        </div>
+      `
+    });
+    const finish = (choice) => {
+      closeModal();
+      resolve(choice);
+    };
+    document.getElementById("syncKeepThisDeviceBtn")?.addEventListener("click", () => finish("local"));
+    document.getElementById("syncUseCloudCopyBtn")?.addEventListener("click", () => finish("cloud"));
+    document.getElementById("syncCancelChoiceBtn")?.addEventListener("click", () => finish("cancel"));
+  });
+}
+
+async function uploadFullDataCloudCopy(connection, previousCloud, syncedAt){
+  const previousStatus = loadLocalSyncStatus();
+  const localBackup = createDataBackupPayload();
+  const records = [];
+  const previousBackup = getFullDataBackupFromRecord(previousCloud?.record);
+  if (previousBackup) records.push(createCloudBackupRecord(previousBackup));
+  const currentRecord = createFullDataSyncRecord(localBackup, syncedAt);
+  records.push(currentRecord);
+  const pushed = await pushCloudSyncRecords(connection, records);
+  const acceptedCurrent = pushed.accepted.find((record) => record.recordId === FULL_DATA_SYNC_RECORD_ID);
+  const cloud = {
+    record: {
+      ...currentRecord,
+      serverRevision: acceptedCurrent?.serverRevision || pushed.serverRevision || previousCloud?.serverRevision || 0
+    },
+    backup: localBackup,
+    serverRevision: acceptedCurrent?.serverRevision || pushed.serverRevision || previousCloud?.serverRevision || 0
+  };
+  clearAllLocalSyncDirty();
+  saveFullDataCloudStatus("full-sync-ok", cloud, {
+    checkedAt: syncedAt,
+    lastSyncAt: syncedAt,
+    lastCloudBackupAt: previousBackup ? syncedAt : previousStatus.lastCloudBackupAt || "",
+    lastCloudBackupRecordId: previousBackup ? records[0].recordId : previousStatus.lastCloudBackupRecordId || "",
+    lastSyncDirection: "upload"
+  });
+  return cloud;
+}
+
+async function applyFullDataCloudCopy(cloud, syncedAt){
+  const backup = cloud?.backup || getFullDataBackupFromRecord(cloud?.record);
+  if (!backup || backup.format !== DATA_BACKUP_FORMAT || !backup.data || !Array.isArray(backup.data.passages)) {
+    throw new Error("Cloud copy is not a valid STEELER data backup.");
+  }
+  downloadJsonPayload(createDataBackupPayload(), "STEELER-Before-cloud-sync-backup");
+  const restored = restoreDataBackupObject(backup, {
+    skipConfirm: true,
+    successMessage: "Cloud copy applied successfully."
+  });
+  if (!restored) throw new Error("Cloud copy was not applied.");
+  clearAllLocalSyncDirty();
+  saveFullDataCloudStatus("full-sync-ok", cloud, {
+    checkedAt: syncedAt,
+    lastSyncAt: syncedAt,
+    lastSyncDirection: "download"
+  });
+}
+
+async function checkFullDataCloudSync(){
+  const btn = document.getElementById("syncPreviewBtn");
+  const connection = getSavedSyncConnection();
+  if (connection.error) {
+    setSyncCheckMessage(connection.error);
+    return;
+  }
+  if (btn) btn.disabled = true;
+  setSyncCheckMessage("Checking cloud copy...");
+  const checkedAt = nowIso();
+
+  try{
+    const cloud = await fetchCurrentFullDataCloudRecord(connection);
+    const summary = describeFullDataCloudRecord(cloud);
+    const localBackup = createDataBackupPayload();
+    const localMatchesCloud = Boolean(cloud.record && fullDataBackupsMatch(localBackup, cloud.backup));
+    const previousStatus = loadLocalSyncStatus();
+    saveLocalSyncStatus({
+      status: localMatchesCloud ? "full-sync-ok" : "full-sync-check-ok",
+      lastRemoteStatus: "ok",
+      lastRemoteCheckAt: checkedAt,
+      lastRemoteRevision: summary.revision,
+      lastFullSyncRevision: localMatchesCloud ? summary.revision : previousStatus.lastFullSyncRevision || "",
+      lastFullSyncAt: localMatchesCloud ? summary.updatedAt || checkedAt : previousStatus.lastFullSyncAt || "",
+      lastFullSyncDeviceId: localMatchesCloud ? summary.deviceId || "" : previousStatus.lastFullSyncDeviceId || "",
+      lastFullSyncDeviceName: localMatchesCloud ? summary.deviceName || "" : previousStatus.lastFullSyncDeviceName || "",
+      lastFullSyncAppVersion: localMatchesCloud ? summary.appVersion || "" : previousStatus.lastFullSyncAppVersion || "",
+      lastObservedFullSyncRevision: summary.revision,
+      lastObservedFullSyncAt: summary.updatedAt || "",
+      lastObservedFullSyncDeviceId: summary.deviceId || "",
+      lastObservedFullSyncDeviceName: summary.deviceName || "",
+      lastObservedFullSyncAppVersion: summary.appVersion || "",
+      checkedAt,
+      lastSyncAt: localMatchesCloud ? checkedAt : previousStatus.lastSyncAt || "",
+      lastSyncDirection: localMatchesCloud ? "matched" : previousStatus.lastSyncDirection || "",
+      lastSyncError: ""
+    });
+    renderLocalSyncStatus();
+    renderFullDataCloudPreview(cloud, localMatchesCloud ? "This device already matches the cloud copy." : "");
+    setSyncCheckMessage(cloud.record
+      ? (localMatchesCloud ? "This device already matches the cloud copy." : `${summary.text}. No data changed.`)
+      : "No cloud copy found yet. Sync Now will create one from this device.");
+  }catch(e){
+    saveLocalSyncStatus({
+      status: "full-sync-check-error",
+      lastRemoteStatus: "error",
+      lastRemoteCheckAt: checkedAt,
+      lastSyncError: e && e.message ? e.message : String(e || "Cloud check failed")
+    });
+    renderLocalSyncStatus();
+    setSyncCheckMessage(`Cloud check failed: ${e && e.message ? e.message : e}`);
+  }finally{
+    if (btn) btn.disabled = false;
+  }
+}
+
+function setFullDataSyncBusy(isBusy){
+  document.querySelectorAll("[data-sync-now-btn='1'], #syncFullBtn, #homeSyncNowBtn").forEach((button) => {
+    button.disabled = Boolean(isBusy);
+  });
+}
+
+async function runFullDataCloudSync(){
+  const connection = getSavedSyncConnection();
+  if (connection.error) {
+    setSyncCheckMessage(connection.error);
+    alert(connection.error);
+    return;
+  }
+  setFullDataSyncBusy(true);
+  setSyncCheckMessage("Checking cloud copy before sync...");
+  const syncedAt = nowIso();
+
+  try{
+    const cloud = await fetchCurrentFullDataCloudRecord(connection);
+    const localBackup = createDataBackupPayload();
+    const localMatchesCloud = Boolean(cloud.record && fullDataBackupsMatch(localBackup, cloud.backup));
+    renderFullDataCloudPreview(cloud, localMatchesCloud ? "This device already matches the cloud copy." : "");
+    if (cloud.record && localMatchesCloud) {
+      clearAllLocalSyncDirty();
+      saveFullDataCloudStatus("full-sync-ok", cloud, {
+        checkedAt: syncedAt,
+        lastSyncAt: syncedAt,
+        lastSyncDirection: "matched"
+      });
+      renderLocalSyncStatus();
+      renderFullDataCloudPreview(cloud, "This device already matches the cloud copy.");
+      setSyncCheckMessage("This device is already synced with cloud.");
+      return;
+    }
+
+    let choice = "local";
+    if (cloudCopyChangedSinceLastSync(cloud)) {
+      choice = await chooseFullSyncConflictAction(cloud);
+      if (choice === "cancel") {
+        setSyncCheckMessage("Sync cancelled. Nothing changed.");
+        return;
+      }
+    } else if (!cloud.record) {
+      const ok = confirm(
+        "Create the first cloud copy?\n\n" +
+        "This will save this device's complete STEELER logbook to cloud so your other devices can use it."
+      );
+      if (!ok) {
+        setSyncCheckMessage("Sync cancelled. Nothing changed.");
+        return;
+      }
+    } else {
+      const ok = confirm(
+        "Save this device's latest changes to cloud?\n\n" +
+        "Cloud will remain the main copy. The previous cloud copy will be kept in recovery backups."
+      );
+      if (!ok) {
+        setSyncCheckMessage("Sync cancelled. Nothing changed.");
+        return;
+      }
+    }
+
+    if (choice === "cloud") {
+      setSyncCheckMessage("Applying cloud copy to this device...");
+      await applyFullDataCloudCopy(cloud, syncedAt);
+      renderLocalSyncStatus();
+      renderFullDataCloudPreview(cloud, "Cloud copy applied to this device. A safety backup downloaded first.");
+      setSyncCheckMessage("Cloud copy applied to this device. A safety backup downloaded first.");
+      return;
+    }
+
+    setSyncCheckMessage("Uploading this device as the current cloud copy...");
+    const updatedCloud = await uploadFullDataCloudCopy(connection, cloud, syncedAt);
+    renderLocalSyncStatus();
+    renderFullDataCloudPreview(updatedCloud, "This device is now the current cloud copy.");
+    setSyncCheckMessage(`Sync complete. This device is now the cloud copy at revision ${describeFullDataCloudRecord(updatedCloud).revision}.`);
+    refreshCloudBackups({ silent: true });
+  }catch(e){
+    saveLocalSyncStatus({
+      status: "full-sync-error",
+      lastRemoteStatus: "error",
+      lastRemoteCheckAt: syncedAt,
+      lastSyncError: e && e.message ? e.message : String(e || "Full data sync failed")
+    });
+    renderLocalSyncStatus();
+    setSyncCheckMessage(`Sync failed: ${e && e.message ? e.message : e}`);
+  }finally{
+    setFullDataSyncBusy(false);
+  }
 }
 
 async function refreshManualSyncPreview(connection, messagePrefix = ""){
@@ -1586,7 +2081,7 @@ function renderCloudBackups(backups){
     <div class="sync-cloud-backup-list">
       ${backups.map((backup) => {
         const deviceId = String(backup.deviceId || "");
-        const shortDeviceId = deviceId ? deviceId.slice(0, 18) : "Unknown";
+        const deviceText = displayDeviceName(backup.deviceName, deviceId);
         const passageText = backup.passageCount == null
           ? "Passages unknown"
           : `${backup.passageCount} passage${backup.passageCount === 1 ? "" : "s"}`;
@@ -1597,7 +2092,7 @@ function renderCloudBackups(backups){
               <span>${escapeHtml(`${backup.appVersion || "Unknown version"} · ${passageText}`)}</span>
             </div>
             <div>
-              <span>${escapeHtml(`Device ${shortDeviceId}`)}</span>
+              <span>${escapeHtml(deviceText)}</span>
               <span>${escapeHtml(`Revision ${backup.serverRevision || 0}`)}</span>
               <button type="button" class="btn btn-secondary sync-download-backup-btn" data-record-id="${escapeHtml(backup.recordId || "")}">Download Backup</button>
               <button type="button" class="btn btn-danger sync-restore-backup-btn" data-record-id="${escapeHtml(backup.recordId || "")}">Restore Backup</button>
@@ -1739,6 +2234,7 @@ function describeDataBackupForRestore(backup, summary = {}){
   const exportedAt = backup?.exportedAt || summary.createdAt || "";
   const appVersion = backup?.appVersion || summary.appVersion || "Unknown version";
   const deviceId = backup?.exportedByDeviceId || summary.deviceId || "Unknown device";
+  const deviceName = backup?.exportedByDeviceName || summary.deviceName || "";
   const latestPassage = Array.isArray(backup?.data?.passages)
     ? backup.data.passages.reduce((latest, p) => {
         const candidate = p?.updatedAt || p?.createdAt || p?.plan?.date || "";
@@ -1750,7 +2246,7 @@ function describeDataBackupForRestore(backup, summary = {}){
     `Backup date: ${formatSyncStatusTime(exportedAt)}`,
     `App version: ${appVersion}`,
     `Passages: ${passagesCount}`,
-    `Device: ${String(deviceId).slice(0, 24)}`,
+    `Device: ${displayDeviceName(deviceName, deviceId)}`,
     latestPassage ? `Latest passage/change: ${latestPassage}` : ""
   ].filter(Boolean).join("\n");
 }
@@ -1847,18 +2343,21 @@ async function restoreCloudBackup(recordId, btn){
 function createCloudBackupRecord(backupPayload){
   const timestamp = nowIso();
   const deviceId = getOrCreateDeviceId();
+  const deviceName = getDeviceName();
   return {
     recordId: makeStableId("cloud_backup"),
     recordType: "cloud-backup",
     schemaVersion: LOCAL_DATA_SCHEMA_VERSION,
     clientUpdatedAt: timestamp,
     lastChangedDeviceId: deviceId,
+    lastChangedDeviceName: deviceName,
     payload: {
       format: "steeler-cloud-backup-record",
       version: 1,
       createdAt: timestamp,
       appVersion: APP_VERSION,
       deviceId,
+      deviceName,
       backup: backupPayload
     }
   };
@@ -1891,6 +2390,7 @@ async function sendCloudBackup(){
       cache: "no-store",
       body: JSON.stringify({
         deviceId: getOrCreateDeviceId(),
+        deviceName: getDeviceName(),
         records: [record]
       })
     });
@@ -2576,7 +3076,9 @@ function upsertPortItemExtended(name, lat=null, lon=null, commsPilotage=null){
     if (existingObj && typeof existingObj === "object"){
       if (existingObj.lat != null) out.lat = Number(existingObj.lat);
       if (existingObj.lon != null) out.lon = Number(existingObj.lon);
-            if (existingObj.commsPilotage) out.commsPilotage = String(existingObj.commsPilotage);
+      if (existingObj.privateNotes) out.privateNotes = String(existingObj.privateNotes);
+      if (existingObj.portNotes) out.privateNotes = String(existingObj.portNotes);
+      if (existingObj.commsPilotage) out.commsPilotage = String(existingObj.commsPilotage);
       else if (existingObj.comments) out.commsPilotage = String(existingObj.comments);
     }
     if (lat != null && lon != null){
@@ -2610,6 +3112,24 @@ function upsertPortItemExtended(name, lat=null, lon=null, commsPilotage=null){
   }
 
   knownPorts.sort((a,b) => portName(a).localeCompare(portName(b)));
+}
+
+function savePortPrivateNotes(name, notes){
+  const n = String(name || "").trim();
+  if (!n) return false;
+  const idx = knownPorts.findIndex(p => portName(p) === n);
+  if (idx < 0) return false;
+  const existing = knownPorts[idx];
+  const port = ensurePortId(typeof existing === "object" ? { ...existing } : { name: n });
+  const clean = String(notes || "").trim();
+  if (clean) port.privateNotes = clean;
+  else {
+    delete port.privateNotes;
+    delete port.portNotes;
+  }
+  knownPorts[idx] = port;
+  knownPorts.sort((a,b) => portName(a).localeCompare(portName(b)));
+  return true;
 }
 
 
@@ -2790,7 +3310,15 @@ function renamePort(oldName, newName){
   // Update MRU
   recentPorts = recentPorts.map(n => n === oldN ? newN : n);
 
-  // Update any saved passages that reference the port name
+  updatePassagePortNameReferences(oldN, newN);
+
+  savePorts();
+  savePassages();
+  refreshPortUI();
+  return { ok:true };
+}
+
+function updatePassagePortNameReferences(oldN, newN){
   try {
     for (const pass of passages || []){
       if (pass?.plan){
@@ -2804,13 +3332,59 @@ function renamePort(oldName, newName){
       }
     }
   } catch (e) {
-    console.warn("renamePort: passage update failed", e);
+    console.warn("Port reference update failed", e);
+  }
+}
+
+function savePortManagerEdit(oldName, values){
+  const oldN = String(oldName || "").trim();
+  const newN = String(values?.name || "").trim();
+  if (!oldN || !newN) return { ok:false, message:"Enter a port name." };
+  if (newN !== oldN && knownPorts.some(p => portName(p) === newN)) return { ok:false, message:"That name already exists." };
+
+  const idx = knownPorts.findIndex(p => portName(p) === oldN);
+  if (idx < 0) return { ok:false, message:"Could not find that port." };
+
+  const existing = knownPorts[idx];
+  const port = ensurePortId(typeof existing === "object" && existing ? { ...existing } : { name: oldN });
+  port.name = newN;
+
+  const coordText = String(values?.coordText || "").trim();
+  if (coordText) {
+    const pair = parseSingleLatLonField(coordText);
+    if (!pair) return { ok:false, message:"Please enter latitude and longitude in one field." };
+    if (!saneForSteeler(pair.lat, pair.lon)) return { ok:false, message:"Those coordinates look unusual for UK/Channel waters. Please double-check." };
+    port.lat = Number(pair.lat);
+    port.lon = Number(pair.lon);
+  } else {
+    delete port.lat;
+    delete port.lon;
   }
 
+  const comms = String(values?.commsPilotage || "").trim();
+  if (comms) port.commsPilotage = comms;
+  else {
+    delete port.commsPilotage;
+    delete port.comments;
+  }
+
+  const privateNotes = String(values?.privateNotes || "").trim();
+  if (privateNotes) port.privateNotes = privateNotes;
+  else {
+    delete port.privateNotes;
+    delete port.portNotes;
+  }
+
+  knownPorts[idx] = port;
+  knownPorts.sort((a,b) => portName(a).localeCompare(portName(b)));
+  if (newN !== oldN) {
+    recentPorts = recentPorts.map(n => n === oldN ? newN : n);
+    updatePassagePortNameReferences(oldN, newN);
+    savePassages();
+  }
   savePorts();
-  savePassages();
   refreshPortUI();
-  return { ok:true };
+  return { ok:true, name:newN };
 }
 
 function makeUniquePortName(base = "New Port"){
@@ -2898,21 +3472,6 @@ function renderPortsManagerList(openName = "") {
     nameInput.className = "ports-name-input";
     nameInput.value = name;
 
-    const renameBtn = document.createElement("button");
-    renameBtn.type = "button";
-    renameBtn.className = "ports-mini";
-    renameBtn.textContent = "Rename";
-    renameBtn.addEventListener("click", () => {
-      const target = (nameInput.value || "").trim();
-      const res = renamePort(name, target);
-      if (!res.ok){
-        alert(res.message || "Could not rename port.");
-        nameInput.value = name;
-        return;
-      }
-      renderPortsManagerList();
-    });
-
     const nameField = document.createElement("label");
     nameField.className = "st-labelled-field";
     const nameLabel = document.createElement("span");
@@ -2921,7 +3480,6 @@ function renderPortsManagerList(openName = "") {
     nameField.appendChild(nameInput);
 
     nameWrap.appendChild(nameField);
-    nameWrap.appendChild(renameBtn);
 
     const coords = document.createElement("div");
     coords.className = "ports-coords";
@@ -2933,29 +3491,7 @@ function renderPortsManagerList(openName = "") {
     coordInput.className = "ports-coord-input ports-coord-combined-input";
     coordInput.value = hasCoords ? formatDMM(latV, lonV) : "";
 
-    const saveBtn = document.createElement("button");
-    saveBtn.type = "button";
-    saveBtn.className = "ports-mini";
-    saveBtn.textContent = "Save position";
-
-    saveBtn.addEventListener("click", () => {
-      const pair = parseSingleLatLonField(coordInput.value);
-      if (!pair){
-        alert("Please enter latitude and longitude in one field.");
-        return;
-      }
-      const la = pair.lat;
-      const lo = pair.lon;
-      if (!saneForSteeler(la, lo)){
-        alert("Those coordinates look a bit daft for UK/Channel waters. Please double-check.");
-        return;
-      }
-      upsertPortItemExtended(name, la, lo, null);
-      savePorts();
-      renderPortsManagerList();
-    });
-
-const lookupBtn = document.createElement("button");
+    const lookupBtn = document.createElement("button");
     lookupBtn.type = "button";
     lookupBtn.className = "ports-mini";
     lookupBtn.textContent = "Lookup";
@@ -2981,7 +3517,6 @@ const lookupBtn = document.createElement("button");
     coordField.appendChild(coordInput);
     coords.appendChild(coordField);
 
-    coords.appendChild(saveBtn);
     coords.appendChild(lookupBtn);
 
     editPanel.appendChild(nameWrap);
@@ -2999,16 +3534,6 @@ const lookupBtn = document.createElement("button");
       ? (typeof item.commsPilotage === "string" ? item.commsPilotage : (typeof item.comments === "string" ? item.comments : ""))
       : "";
 
-    const commentsSaveBtn = document.createElement("button");
-    commentsSaveBtn.type = "button";
-    commentsSaveBtn.className = "ports-mini";
-    commentsSaveBtn.textContent = "Save Comms / Pilotage";
-    commentsSaveBtn.addEventListener("click", () => {
-      upsertPortItemExtended(name, null, null, commentsInput.value);
-      savePorts();
-      renderPortsManagerList();
-    });
-
     const commentsField = document.createElement("label");
     commentsField.className = "st-labelled-field";
     const commentsLabel = document.createElement("span");
@@ -3016,8 +3541,58 @@ const lookupBtn = document.createElement("button");
     commentsField.appendChild(commentsLabel);
     commentsField.appendChild(commentsInput);
     commentsWrap.appendChild(commentsField);
-    commentsWrap.appendChild(commentsSaveBtn);
     editPanel.appendChild(commentsWrap);
+
+    const privateNotesWrap = document.createElement("div");
+    privateNotesWrap.className = "ports-comments";
+
+    const privateNotesEditor = document.createElement("div");
+    privateNotesEditor.className = "ports-comment-input ports-note-editor";
+    privateNotesEditor.contentEditable = "true";
+    privateNotesEditor.setAttribute("role", "textbox");
+    privateNotesEditor.setAttribute("aria-multiline", "true");
+    privateNotesEditor.dataset.placeholder = "Berthing tips, facilities, local reminders...";
+    const privateNotesValue = (item && typeof item === "object")
+      ? (typeof item.privateNotes === "string" ? item.privateNotes : (typeof item.portNotes === "string" ? item.portNotes : ""))
+      : "";
+    setEditableNoteText(privateNotesEditor, privateNotesValue);
+
+    const privateNotesField = document.createElement("label");
+    privateNotesField.className = "st-labelled-field";
+    const privateNotesLabel = document.createElement("span");
+    privateNotesLabel.textContent = "Private Notes";
+    privateNotesField.appendChild(privateNotesLabel);
+    privateNotesField.appendChild(privateNotesEditor);
+    privateNotesWrap.appendChild(privateNotesField);
+
+    privateNotesEditor.addEventListener("blur", () => {
+      setEditableNoteText(privateNotesEditor, getEditableNoteText(privateNotesEditor));
+    });
+    privateNotesEditor.addEventListener("paste", (ev) => {
+      ev.preventDefault();
+      const text = ev.clipboardData?.getData("text/plain") || "";
+      document.execCommand("insertText", false, text);
+    });
+    editPanel.appendChild(privateNotesWrap);
+
+    const saveDetailsBtn = document.createElement("button");
+    saveDetailsBtn.type = "button";
+    saveDetailsBtn.className = "ports-mini ports-save-details";
+    saveDetailsBtn.textContent = "Save Port Details";
+    saveDetailsBtn.addEventListener("click", () => {
+      const res = savePortManagerEdit(name, {
+        name: nameInput.value,
+        coordText: coordInput.value,
+        commsPilotage: commentsInput.value,
+        privateNotes: getEditableNoteText(privateNotesEditor)
+      });
+      if (!res.ok) {
+        alert(res.message || "Could not save port details.");
+        return;
+      }
+      renderPortsManagerList(res.name || nameInput.value || name);
+    });
+    editPanel.appendChild(saveDetailsBtn);
 
     left.appendChild(summary);
     left.appendChild(editPanel);
@@ -3036,12 +3611,12 @@ const lookupBtn = document.createElement("button");
     row.appendChild(left);
     row.appendChild(right);
     row.addEventListener("click", (ev) => {
-      if (ev.target.closest("button, input, textarea, select, a")) return;
+      if (ev.target.closest("button, input, textarea, select, a, [contenteditable]")) return;
       row.classList.toggle("is-editing");
     });
     row.addEventListener("keydown", (ev) => {
       if (ev.key !== "Enter" && ev.key !== " ") return;
-      if (ev.target.closest("button, input, textarea, select, a")) return;
+      if (ev.target.closest("button, input, textarea, select, a, [contenteditable]")) return;
       ev.preventDefault();
       row.classList.toggle("is-editing");
     });
@@ -3680,15 +4255,17 @@ function escapeHtml(str) {
 function linkifyNoteHtml(value){
   const text = String(value || "");
   if (!text) return "";
-  const urlPattern = /\b((?:https?:\/\/|www\.)[^\s<>"']+|(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s<>"']*)?)/gi;
+  const linkPattern = /\b([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|(?:https?:\/\/|www\.)[^\s<>"']+|(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s<>"']*)?)/gi;
   let html = "";
   let lastIndex = 0;
-  text.replace(urlPattern, (match, _url, offset) => {
+  text.replace(linkPattern, (match, _link, offset) => {
     html += escapeHtml(text.slice(lastIndex, offset));
     const trailing = match.match(/[),.;:!?]+$/)?.[0] || "";
     const clean = trailing ? match.slice(0, -trailing.length) : match;
     const lower = clean.toLowerCase();
-    const href = lower.startsWith("http://") || lower.startsWith("https://") ? clean : `https://${clean}`;
+    const href = clean.includes("@")
+      ? `mailto:${clean}`
+      : (lower.startsWith("http://") || lower.startsWith("https://") ? clean : `https://${clean}`);
     html += `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" data-note-link="true">${escapeHtml(clean)}</a>${escapeHtml(trailing)}`;
     lastIndex = offset + match.length;
     return match;
@@ -3697,12 +4274,31 @@ function linkifyNoteHtml(value){
   return html.replace(/\n/g, "<br>");
 }
 
+function setEditableNoteText(el, value){
+  if (!el) return;
+  el.innerHTML = linkifyNoteHtml(value);
+  activateNoteLinks(el);
+}
+
+function getEditableNoteText(el){
+  if (!el) return "";
+  return String(el.innerText || "").replace(/\n+$/, "");
+}
+
 function activateNoteLinks(root){
   root?.querySelectorAll?.("a[data-note-link]")?.forEach(link => {
     if (link.dataset.noteLinkReady === "true") return;
     link.dataset.noteLinkReady = "true";
     link.addEventListener("click", (ev) => {
+      ev.preventDefault();
       ev.stopPropagation();
+      const href = link.getAttribute("href");
+      if (!href) return;
+      if (href.toLowerCase().startsWith("mailto:")) {
+        window.location.href = href;
+      } else {
+        window.open(href, "_blank", "noopener,noreferrer");
+      }
     });
   });
 }
@@ -3918,6 +4514,7 @@ const tabButtons = document.querySelectorAll(".tab-btn");
 const tabs       = document.querySelectorAll(".tab");
 
 const homeNewPassageBtn = document.getElementById("homeNewPassageBtn");
+const homeSyncNowBtn = document.getElementById("homeSyncNowBtn");
 const homeCopyPassageBtn = document.getElementById("homeCopyPassageBtn");
 const homePassageList   = document.getElementById("homePassageList");
 const homePassageSearch = document.getElementById("homePassageSearch");
@@ -4595,6 +5192,7 @@ function createDataBackupPayload(){
     exportedAt: new Date().toISOString(),
     appVersion: APP_VERSION,
     exportedByDeviceId: getOrCreateDeviceId(),
+    exportedByDeviceName: getDeviceName(),
     data: {
       passages,
       theme: storage.getItem(THEME_KEY) || "day",
@@ -6622,6 +7220,8 @@ function savedWaypointToDppWaypoint(saved){
     manualDistToNext: "",
     cogToNext: "",
     plannedSpeed: "",
+    tideKt: "",
+    sogToNext: "",
     timeToNext: "",
     fuelToNext: ""
   };
@@ -6671,6 +7271,8 @@ function routePortToDppWaypoint(point){
     manualDistToNext: "",
     cogToNext: "",
     plannedSpeed: "",
+    tideKt: "",
+    sogToNext: "",
     timeToNext: "",
     fuelToNext: ""
   };
@@ -6733,6 +7335,8 @@ function readDppTemplateEditorForm(){
       manualDistToNext: (row.querySelector(".template-wp-distance-override")?.value || "").trim(),
       cogToNext: "",
       plannedSpeed: (row.querySelector(".template-wp-speed")?.value || "").trim(),
+      tideKt: (row.querySelector(".template-wp-tide")?.value || "").trim(),
+      sogToNext: "",
       timeToNext: "",
       fuelToNext: ""
     });
@@ -6760,6 +7364,7 @@ function renderDppTemplateEditorRows(detailed){
       <td><input type="text" class="template-wp-coords" value="${escapeHtml(wp.coordsText || formatDetailedWaypointCoords(Number(wp.lat), Number(wp.lon)))}" placeholder="50.57507° N, 2.44846° W"></td>
       <td><input type="number" step="0.1" inputmode="decimal" class="template-wp-distance-override" value="${escapeHtml(wp.manualDistToNext || "")}" placeholder="${wp.distToNext !== "" ? escapeHtml(String(wp.distToNext)) : "NM"}"></td>
       <td><input type="number" step="0.1" inputmode="decimal" class="template-wp-speed" value="${escapeHtml(wp.plannedSpeed || "")}" placeholder="kt"></td>
+      <td><input type="number" step="0.1" inputmode="decimal" class="template-wp-tide" value="${escapeHtml(wp.tideKt || "")}" placeholder="+/- kt"></td>
       <td><button type="button" class="btn btn-secondary btn-small template-wp-delete">Delete</button></td>
     </tr>
   `).join("");
@@ -6796,7 +7401,8 @@ function openDppTemplateEditor(id){
               <th>Waypoint</th>
               <th>WP Lat/Lon</th>
               <th>NM</th>
-              <th>Plan kt</th>
+              <th>STW kt</th>
+              <th>Tide kt</th>
               <th></th>
             </tr>
           </thead>
@@ -6854,6 +7460,8 @@ function openDppTemplateEditor(id){
       manualDistToNext: "",
       cogToNext: "",
       plannedSpeed: "",
+      tideKt: "",
+      sogToNext: "",
       timeToNext: "",
       fuelToNext: ""
     });
@@ -7081,6 +7689,8 @@ function readSettingsDppWorkspaceForm(){
       manualDistToNext: (row.querySelector(".dpp-distance-override")?.value || "").trim(),
       cogToNext: "",
       plannedSpeed: (row.querySelector(".dpp-speed")?.value || "").trim(),
+      tideKt: (row.querySelector(".dpp-tide")?.value || "").trim(),
+      sogToNext: "",
       timeToNext: "",
       fuelToNext: "",
       actualTime: fallback.waypoints[idx]?.actualTime || ""
@@ -7183,14 +7793,16 @@ function renderSettingsDppWorkspace(){
             <th>Lat / Lon</th>
             <th>Dist<br>NM</th>
             <th>COG<br>°T</th>
-            <th>Plan<br>kt</th>
+            <th>STW<br>kt</th>
+            <th>Tide<br>kt</th>
+            <th>SOG<br>kt</th>
             <th>Time<br>Next</th>
             <th>Fuel<br>L</th>
             <th colspan="3">Totals to Destination</th>
             <th>Actions</th>
           </tr>
           <tr class="dpp-subhead-row">
-            <th colspan="8"></th>
+            <th colspan="10"></th>
             <th>NM</th>
             <th>Time</th>
             <th>Fuel</th>
@@ -7206,6 +7818,8 @@ function renderSettingsDppWorkspace(){
               <td><input type="number" step="0.1" inputmode="decimal" class="dpp-distance-override" value="${escapeHtml(wp.manualDistToNext || "")}" placeholder="${wp.distToNext !== "" ? escapeHtml(String(wp.distToNext)) : "NM"}" title="Override distance to next waypoint"></td>
               <td>${wp.cogToNext ? escapeHtml(wp.cogToNext) : "–"}</td>
               <td><input type="number" step="0.1" inputmode="decimal" class="dpp-speed" value="${escapeHtml(wp.plannedSpeed || "")}" placeholder="kt"></td>
+              <td><input type="number" step="0.1" inputmode="decimal" class="dpp-tide" value="${escapeHtml(wp.tideKt || "")}" placeholder="+/-"></td>
+              <td>${wp.sogToNext !== "" && wp.sogToNext != null ? escapeHtml(String(wp.sogToNext)) : "–"}</td>
               <td>${wp.timeToNext ? escapeHtml(wp.timeToNext) : "–"}</td>
               <td>${wp.fuelToNext !== "" && wp.fuelToNext != null ? escapeHtml(String(wp.fuelToNext)) : "–"}</td>
               <td>${escapeHtml(String(dppRunningTotals[idx]?.totalNm ?? 0))}</td>
@@ -7223,6 +7837,8 @@ function renderSettingsDppWorkspace(){
           <tr class="dpp-totals-row">
             <td colspan="3">Totals</td>
             <td>${escapeHtml(String(dppTotals.totalNm || 0))}</td>
+            <td></td>
+            <td></td>
             <td></td>
             <td></td>
             <td>${escapeHtml(dppTotals.totalDuration || "00:00")}</td>
@@ -7307,6 +7923,8 @@ function renderSettingsDppWorkspace(){
       manualDistToNext: "",
       cogToNext: "",
       plannedSpeed: "",
+      tideKt: "",
+      sogToNext: "",
       timeToNext: "",
       fuelToNext: ""
     });
@@ -9595,21 +10213,61 @@ function getAllFuelRelevantEntries(){
     .sort((a, b) => getLogEntrySortKey(a.passage, a.entry).localeCompare(getLogEntrySortKey(b.passage, b.entry)));
 }
 
+function fuelCutoffDateFromInput(value){
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function fuelEntryIsAfterCutoff(passage, entry, cutoffDate){
+  if (!cutoffDate) return true;
+  const entryDate = logEntrySortDate(passage, entry);
+  if (!entryDate || Number.isNaN(entryDate.getTime())) return false;
+  return entryDate >= cutoffDate;
+}
+
+function fuelEntryIsBeforeLimit(passage, entry, limitDate){
+  if (!limitDate) return true;
+  const entryDate = logEntrySortDate(passage, entry);
+  if (!entryDate || Number.isNaN(entryDate.getTime())) return false;
+  return entryDate <= limitDate;
+}
+
 function computeFuelManagementStats({ beforeTime = "", excludeEntryId = "" } = {}){
   const settings = loadFuelManagementSettings();
-  const resetAt = String(settings.resetAt || "");
+  const resetDate = fuelCutoffDateFromInput(settings.resetAt);
+  const beforeDate = fuelCutoffDateFromInput(beforeTime);
   let remaining = numberOrNull(settings.resetLevel);
   let refuelLitres = 0;
   let refuelCost = 0;
   let fuelUsed = 0;
   let refuelCount = 0;
   let fuelUseEntryCount = 0;
+  const latestFuelUseByLeg = new Map();
+  const fuelEntries = getAllFuelRelevantEntries()
+    .filter(({ entry }) => !(excludeEntryId && String(entry.id) === String(excludeEntryId)))
+    .filter(({ passage, entry }) => fuelEntryIsBeforeLimit(passage, entry, beforeDate));
+  const hasLoggedRefuel = fuelEntries.some(({ entry }) => !!entry.refuel);
 
-  getAllFuelRelevantEntries().forEach(({ entry }) => {
-    if (excludeEntryId && String(entry.id) === String(excludeEntryId)) return;
-    const time = String(entry.time || "");
-    if (resetAt && time && time < resetAt) return;
-    if (beforeTime && time && time > beforeTime) return;
+  fuelEntries.forEach(({ passage, entry }) => {
+    if (!hasLoggedRefuel && !fuelEntryIsAfterCutoff(passage, entry, resetDate)) return;
+
+    const used = numberOrNull(entry.fuelUsed);
+    if (used != null && used > 0) {
+      const key = `${passage?.id || ""}::${entry.leg ?? 0}`;
+      const entryDate = logEntrySortDate(passage, entry);
+      const previousUsed = latestFuelUseByLeg.get(key)?.used || 0;
+      const deltaUsed = Math.max(0, used - previousUsed);
+      if (deltaUsed > 0) {
+        fuelUsed += deltaUsed;
+        if (remaining != null) remaining = Math.max(0, remaining - deltaUsed);
+      }
+      latestFuelUseByLeg.set(key, {
+        used,
+        time: entryDate && !Number.isNaN(entryDate.getTime()) ? entryDate.getTime() : 0
+      });
+    }
 
     const refuel = entry.refuel || null;
     if (refuel) {
@@ -9622,19 +10280,19 @@ function computeFuelManagementStats({ beforeTime = "", excludeEntryId = "" } = {
       }
       if (refuel.tankFull) {
         remaining = settings.tankCapacity;
-      } else if (remaining != null) {
-        remaining = Math.min(settings.tankCapacity, remaining + litres);
+        fuelUsed = 0;
+        latestFuelUseByLeg.clear();
+      } else {
+        const storedRemaining = numberOrNull(refuel.tankRemaining);
+        if (storedRemaining != null) {
+          remaining = Math.max(0, Math.min(settings.tankCapacity, storedRemaining));
+        } else if (remaining != null) {
+          remaining = Math.min(settings.tankCapacity, remaining + litres);
+        }
       }
-      if (numberOrNull(refuel.tankRemaining) != null) remaining = numberOrNull(refuel.tankRemaining);
-    }
-
-    const used = numberOrNull(entry.fuelUsed);
-    if (used != null && used > 0) {
-      fuelUsed += used;
-      fuelUseEntryCount += 1;
-      if (remaining != null) remaining = Math.max(0, remaining - used);
     }
   });
+  fuelUseEntryCount = Array.from(latestFuelUseByLeg.values()).filter(item => item && item.used > 0).length;
 
   return {
     settings,
@@ -10560,6 +11218,8 @@ homeNewPassageBtn.addEventListener("click", () => {
   createPassage();
   switchToTab("planTab");
 });
+
+homeSyncNowBtn?.addEventListener("click", runFullDataCloudSync);
 
 homeCopyPassageBtn?.addEventListener("click", () => {
   const p = getCurrentPassage();

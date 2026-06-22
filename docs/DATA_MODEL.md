@@ -19,8 +19,9 @@ The app is an offline-first browser PWA. User data is stored in `localStorage` a
 | `steeler_fuel_management_v1` | Fuel tank/reset settings | JSON fuel management object |
 | `steeler_log_split_ratio_v1` | Log/plan split layout preference | Plain string number |
 | `steeler_device_id_v1` | Local device/client identity for future sync | Plain string generated locally; not restored from data backups |
+| `steeler_device_name_v1` | Human-friendly local device name for sync display | Plain string edited locally; not restored from data backups |
 | `steeler_sync_status_v1` | Local sync status summary | JSON object; records local changes, Worker checks, and one-way cloud backup status |
-| `steeler_sync_config_v1` | Staging sync connection settings | JSON object containing Worker URL and local token; not included in full data backups |
+| `steeler_sync_config_v1` | Cloud sync connection settings | JSON object containing Worker URL and local token; not included in full data backups |
 
 ## Safety Mirror Keys
 
@@ -203,12 +204,14 @@ Tide stations are planned data. Manual fields are the editable source of truth; 
   manualDistToNext: "",
   cogToNext: "187",
   plannedSpeed: "8.0",
+  tideKt: "-1.2",
+  sogToNext: 6.8,
   timeToNext: "01:33",
   fuelToNext: 21.7
 }
 ```
 
-`distToNext`, `cogToNext`, `timeToNext`, and `fuelToNext` are recalculated from coordinates and planned speed. They are stored in passage data today, but should be treated as derived values. `manualDistToNext` can override the calculated distance for the leg starting at that waypoint, for example where a river route is longer than the straight-line waypoint distance.
+`distToNext`, `cogToNext`, `sogToNext`, `timeToNext`, and `fuelToNext` are recalculated from coordinates, STW (`plannedSpeed`), and optional tide/current effect (`tideKt`). They are stored in passage data today, but should be treated as derived values. `manualDistToNext` can override the calculated distance for the leg starting at that waypoint, for example where a river route is longer than the straight-line waypoint distance. Timing uses SOG (`plannedSpeed + tideKt`), while fuel burn uses the STW fuel curve over the resulting elapsed time.
 
 ## DppTemplateStore
 
@@ -234,7 +237,7 @@ Stored separately from passages in `steeler_dpp_templates_v1`. These templates a
 }
 ```
 
-DPP templates include waypoint planned speeds plus the leg-specific `hazards`, `portsOfRefuge`, and `crewWelfare` fields. When a template is used, waypoint IDs are regenerated for the target leg so the saved template remains independent of the passage.
+DPP templates include waypoint STW speeds and tide/current values plus the leg-specific `hazards`, `portsOfRefuge`, and `crewWelfare` fields. When a template is used, waypoint IDs are regenerated for the target leg so the saved template remains independent of the passage.
 
 ## DppWaypointStore
 
@@ -362,6 +365,7 @@ Stored inside `steeler_logbook_ports_v1.data.all`.
   lat: 49.642,
   lon: -1.622,
   commsPilotage: "",
+  privateNotes: "",
   createdAt: "2026-05-03T12:00:00.000Z",
   updatedAt: "2026-05-03T12:00:00.000Z",
   schemaVersion: 1,
@@ -369,7 +373,7 @@ Stored inside `steeler_logbook_ports_v1.data.all`.
 }
 ```
 
-Older data may contain strings or objects without ids. The current app normalises known ports on load and removes legacy `tideId` fields.
+Older data may contain strings or objects without ids. The current app normalises known ports on load and removes legacy `tideId` fields. `commsPilotage` can be copied into Plan Comms / Pilotage; `privateNotes` stays in Port settings only.
 
 ## SafetyEmergencyInfo
 
@@ -491,11 +495,13 @@ Stored in `steeler_fuel_management_v1`.
 
 ```js
 {
-  tankCapacity: 2000,
+  tankCapacity: 800,
   resetAt: "2026-05-03T12:00",
-  resetLevel: 2000
+  resetLevel: 800
 }
 ```
+
+Fuel management processes logged fuel entries in chronological order. A full-tank refuel starts the tank estimate from `tankCapacity` and resets the displayed fuel-used total. A partial refuel adds the entered litres to the current estimate, capped at `tankCapacity`; if the entry has a stored tank remaining value, that exact estimate is used. The displayed fuel used counts the latest `fuelUsed` value per passage leg after the most recent full-tank or manual baseline. If no logged refuel entries exist, the saved manual `resetAt` / `resetLevel` fields act as the fallback baseline.
 
 ## Backup Payloads
 
@@ -509,6 +515,7 @@ Primary full data backup:
   exportedAt: "2026-05-03T12:00:00.000Z",
   appVersion: "1.2.4",
   exportedByDeviceId: "device_...",
+  exportedByDeviceName: "Bill's MacBook Pro",
   data: {
     passages: Passage[],
     theme: "day",
@@ -605,6 +612,7 @@ Manual Sync Preview builds local sync records, but does not upload or apply them
   schemaVersion: 1,
   clientUpdatedAt: "2026-05-03T12:00:00.000Z",
   lastChangedDeviceId: "device_...",
+  lastChangedDeviceName: "Bill's MacBook Pro",
   deleted: false,
   payload: {
     format: "steeler-sync-record",
@@ -617,19 +625,30 @@ Manual Sync Preview builds local sync records, but does not upload or apply them
 }
 ```
 
-Global record ids currently include `global:ports`, `global:safety-info`, `global:legacy-ec-settings`, `global:dpp-templates`, `global:dpp-waypoints`, `global:weather-abbreviations`, `global:fuel-management`, and `global:app-settings`.
+The previous per-record sync shape is retained only as historical compatibility data. v1.3.0 uses one current full-data cloud record instead:
 
-The Worker summary endpoint `/v1/records/summary` returns record metadata only. It is used to preview how many records are safe to send, safe to receive, or need review without moving the actual record payloads.
+```js
+{
+  recordId: "global:full-data-sync",
+  recordType: "full-data-sync",
+  schemaVersion: 1,
+  clientUpdatedAt: "2026-06-13T12:00:00.000Z",
+  lastChangedDeviceId: "device_...",
+  deleted: false,
+  payload: {
+    format: "steeler-full-data-sync-record",
+    version: 1,
+    appVersion: "1.3.0",
+    deviceId: "device_...",
+    deviceName: "Bill's MacBook Pro",
+    backup: DataBackupPayload
+  }
+}
+```
 
-A record needs review when the same record exists locally and in cloud, the timestamps differ, and the last-changed device ids differ. Manual send/receive leaves these records untouched.
+Sync Now fetches only the current `full-data-sync` record, then compares this device's current data with the current cloud backup first. If they already match, the app confirms that the device is synced and does not upload another cloud copy. If the device has changes and the cloud record has not changed since this device last synced, the device backup can be saved as the current cloud copy. If the cloud record changed since this device last synced and the data differs, the user chooses either this device's full backup or the cloud full backup. When this device replaces an existing cloud copy, the previous cloud backup is preserved as a `cloud-backup` recovery record.
 
-Review items are resolved one at a time. Choosing "Keep this device" posts the selected local sync record to `/v1/records/push`. Choosing "Use cloud" first downloads a safety backup, then applies only the selected cloud sync record locally.
-
-Full Sync combines the existing safe send and safe receive operations. It does not resolve needs-review records automatically.
-
-Send Sync Records posts selected local sync records to `/v1/records/push`. After the Worker accepts every selected record, local `syncDirty` flags are cleared for the accepted passages, log entries, and ports. This marks those local changes as sent, but does not receive or merge remote records.
-
-Receive Sync Records uses `/v1/records` to fetch full cloud records, filters them to the records shown in the Receive preview, downloads a local safety backup, and applies only those selected records. It can receive passages and the global record types listed above. It does not send local records.
+Using the cloud copy downloads a local safety backup first, then restores the cloud `steeler-data-backup`. The device id key remains local-only and is not restored from the backup.
 
 Legacy full logbook backup:
 

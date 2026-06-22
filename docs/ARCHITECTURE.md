@@ -51,20 +51,16 @@ It remains deliberately conservative until broader multi-device safety testing i
 - Parse failures should be visible and recoverable, with a route to export raw corrupted data before reset or recovery.
 - Backup/restore format changes must be backward compatible.
 - The primary v1.2.4 backup format is `steeler-data-backup`, which archives all local STEELER data on the device. Older logbook, ports, and DPP backup formats remain readable where supported.
-- A local `steeler_device_id_v1` value identifies this browser/device for future sync. It is created locally and must not be replaced by restoring a data backup.
+- A local `steeler_device_id_v1` value identifies this browser/device for sync. A separate local `steeler_device_name_v1` stores the human-friendly display name, such as `Bill's MacBook Pro`, used in sync status and conflict prompts. The id is created locally and must not be replaced by restoring a data backup.
 - Passage and log-entry deletion is recoverable: deleted records stay in local passage data with `deleted: true`, but are hidden from normal operational views and exports.
-- `steeler_sync_status_v1` stores local sync preparation status, including pending local change counts, last local change time, Worker check results, and the last one-way cloud backup result.
-- `steeler_sync_config_v1` stores the sync Worker URL and token locally so Settings can test `/v1/status`, preview sync, send sync records, receive sync records, send a one-way cloud backup, list recent cloud backup summaries, download a selected backup JSON file, and manually restore a selected cloud backup. The token is not included in full data backups.
-- Manual Sync Preview builds local `steeler-sync-record` payloads for passages, ports, Safety/Emergency, legacy emergency-contact settings, DPP templates, DPP waypoints, weather abbreviations, fuel settings, and app settings. It compares them with `/v1/records/summary` and does not upload or apply records.
-- Preview Sync separates records into safe to send, safe to receive, and needs review. A record needs review when local and cloud versions both exist, differ, and appear to have been last changed by different devices.
-- When applying a received passage, v1.2.4 preserves a locally richer Daily Summary list over a sparse cloud copy and leaves the passage dirty so the preserved summaries can be sent back to Cloudflare.
-- Preview details include lightweight summaries for shared global records, including Ports, Safety Info, DPP templates, DPP waypoints, weather abbreviations, fuel settings, and app settings.
-- Needs-review records can be resolved one at a time by keeping this device's version or using the cloud version. Keeping this device sends only that one local record to Cloudflare. Using cloud downloads a local safety backup first, then applies only that one cloud record.
-- Full Sync sends records marked safe to send, receives records marked safe to receive, downloads a local safety backup before receiving anything, refreshes the preview when finished, and leaves needs-review records untouched.
-- The main sync UI shows Preview Sync and Full Sync first. Advanced sync tools expose one-way send/receive, Worker check, and cloud backup controls.
-- Send Sync Records sends only the records that Preview Sync marks as safe to send via `/v1/records/push`. After every selected record is accepted, local sync-dirty flags are cleared. Records needing review are left untouched. It does not receive, merge, restore, or overwrite local data.
-- Receive Sync Records fetches only the cloud records that Preview Sync marks as safe to receive. It downloads a local safety backup first, warns if this device also has local records waiting to upload, and applies only the selected received records. Records needing review are left untouched. It does not send local records.
-- The manual cloud backup uses `/v1/records/push` with record type `cloud-backup`. The read-only backup list uses `/v1/backups`; selected backup download/restore uses `/v1/backups/{recordId}`. Restore first downloads a local safety backup and requires two confirmations. These workflows do not pull or merge sync records into the app.
+- `steeler_sync_status_v1` stores local sync status, including pending local change counts, last local change time, observed cloud revision, last synced cloud revision, and the device id/name that last updated the cloud copy.
+- `steeler_sync_config_v1` stores the sync Worker URL and token locally so Settings can check the current cloud copy, run Sync Now, list recovery backup summaries, download a selected backup JSON file, and manually restore a selected recovery backup. The token is not included in full data backups.
+- Simplified cloud sync treats STEELER data as one complete logbook package. The current cloud copy is a Worker record with id `global:full-data-sync` and type `full-data-sync`; its payload contains a full `steeler-data-backup`.
+- Sync Now first checks the current cloud copy by fetching only the `full-data-sync` record from the Worker. If this device already matches cloud, the app marks it synced and does not upload. If this device has changes and the cloud revision has not changed since this device last synced, this device can upload its complete data package as the current cloud copy.
+- If the cloud revision has changed since this device last synced, the app shows which device last updated the cloud copy and asks whether to keep this device's complete copy, use the cloud copy, or cancel.
+- Choosing Keep This Device pushes this device's full backup as the current cloud copy. If a previous cloud copy exists, it is first preserved as a `cloud-backup` recovery record.
+- Choosing Use Cloud Copy downloads a safety backup of the current local data first, then restores the complete cloud backup locally. The local `steeler_device_id_v1` remains device-local and is not replaced by backup restore.
+- Recovery backups use `/v1/records/push` with record type `cloud-backup`. The read-only backup list uses `/v1/backups`; selected backup download/restore uses `/v1/backups/{recordId}`. Manual restore first downloads a local safety backup and requires two confirmations.
 
 ## Service Worker Release Rules
 
@@ -102,4 +98,5 @@ These areas are still tightly coupled to application state, DOM event binding, m
 - Detailed Passage Plan templates are stored globally in a separate localStorage key and can be applied to the selected leg after confirmation.
 - Detailed Passage Plan templates can be edited/renamed/deleted in Settings, are included in full backups, and have separate export/import.
 - DPP hazards, ports of refuge and crew welfare fields are leg-specific within the existing multi-leg DPP model.
+- DPP waypoint rows use STW plus optional tide/current effect to derive SOG. SOG drives ETA/time calculations; fuel burn uses the STW fuel curve over the derived elapsed time.
 - Multi-leg EC start/end SMS wording reflects transit stops and per-leg passage completion.

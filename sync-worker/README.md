@@ -4,7 +4,7 @@ This folder contains the isolated Cloudflare Worker prototype for the v1.2.0 dat
 
 The browser app calls this Worker manually from Settings for sync checks, manual sync preview, one-way cloud backup uploads, read-only backup listing, selected backup JSON download, and guarded cloud-backup restore. It is still deliberately conservative: there is no automatic sync or merge path yet.
 
-Staging Worker URL:
+Worker URL:
 
 ```text
 https://steeler-logbook-sync.bill-merry-52f.workers.dev
