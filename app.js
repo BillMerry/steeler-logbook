@@ -11,15 +11,28 @@ const DEVICE_ID_KEY = "steeler_device_id_v1";
 const DEVICE_NAME_KEY = "steeler_device_name_v1";
 const SYNC_STATUS_KEY = "steeler_sync_status_v1";
 const SYNC_CONFIG_KEY = "steeler_sync_config_v1";
-const SYNC_RECORD_META_KEY = "steeler_sync_record_meta_v1";
+const WEATHER_ABBR_ENABLED_KEY = "steeler_weather_abbreviations_enabled_v1";
 
-const APP_VERSION = "1.3.2";
+const APP_VERSION = "1.3.3";
 const LOCAL_DATA_SCHEMA_VERSION = 1;
 const DATA_BACKUP_FORMAT = "steeler-data-backup";
 const DEFAULT_SYNC_WORKER_URL = "https://steeler-logbook-sync.bill-merry-52f.workers.dev";
 const LEGACY_STAGING_SYNC_WORKER_URL = "https://steeler-logbook-sync-staging.bill-merry-52f.workers.dev";
 const FULL_DATA_SYNC_RECORD_ID = "global:full-data-sync";
 const FULL_DATA_SYNC_RECORD_TYPE = "full-data-sync";
+const COMPLETE_DATA_SYNC_KEYS = new Set([
+  STORAGE_KEY,
+  THEME_KEY,
+  PORTS_KEY,
+  "steeler_safety_emergency_info_v1",
+  "steeler_ec_settings_v1",
+  "STEELER_ABBR_DB_V1",
+  DPP_TEMPLATES_KEY,
+  DPP_WAYPOINTS_KEY,
+  FUEL_MANAGEMENT_KEY,
+  LOG_SPLIT_RATIO_KEY,
+  WEATHER_ABBR_ENABLED_KEY
+]);
 const DEFAULT_PASSAGE_TIME_ZONE = "Europe/London";
 const PASSAGE_TIME_ZONES = {
   "Europe/London": "BST",
@@ -29,6 +42,7 @@ const PASSAGE_TIME_ZONES = {
 
 const storageSaveWarningsShown = new Set();
 const storageRecoveryWarningsShown = new Set();
+let suppressLocalSyncTracking = false;
 
 const STORAGE_SAFETY_CONFIG = {
   "steeler_logbook_passages_v5": {
@@ -157,7 +171,8 @@ function loadSyncConfig(){
   const fallback = {
     version: 1,
     workerUrl: DEFAULT_SYNC_WORKER_URL,
-    token: ""
+    token: "",
+    autoSyncEnabled: false
   };
   const stored = loadLocalStorageJsonItem(
     SYNC_CONFIG_KEY,
@@ -171,7 +186,8 @@ function loadSyncConfig(){
     ...stored,
     version: 1,
     workerUrl: cleanWorkerUrl === LEGACY_STAGING_SYNC_WORKER_URL ? DEFAULT_SYNC_WORKER_URL : cleanWorkerUrl,
-    token: String(stored?.token || "")
+    token: String(stored?.token || ""),
+    autoSyncEnabled: stored?.autoSyncEnabled === true
   };
 }
 
@@ -183,6 +199,7 @@ function saveSyncConfig(config){
   };
   clean.workerUrl = String(clean.workerUrl || DEFAULT_SYNC_WORKER_URL).trim().replace(/\/+$/g, "");
   clean.token = String(clean.token || "");
+  clean.autoSyncEnabled = clean.autoSyncEnabled === true;
   storage.setItem(SYNC_CONFIG_KEY, JSON.stringify(clean));
   return clean;
 }
@@ -225,6 +242,7 @@ function saveLocalSyncStatus(status){
       updatedAt: nowIso()
     };
     storage.setItem(SYNC_STATUS_KEY, JSON.stringify(clean));
+    updateAutoSyncFooterStatus(clean);
     return clean;
   }catch(e){
     console.warn("Could not save sync status", e);
@@ -232,7 +250,7 @@ function saveLocalSyncStatus(status){
   }
 }
 
-function countPendingLocalChanges(){
+function countLocalDirtySyncMarkers(){
   let count = 0;
   (Array.isArray(passages) ? passages : []).forEach((p) => {
     if (p?.syncDirty) count += 1;
@@ -244,6 +262,10 @@ function countPendingLocalChanges(){
     if (port?.syncDirty) count += 1;
   });
   return count;
+}
+
+function countPendingLocalChanges(){
+  return countLocalDirtySyncMarkers();
 }
 
 function countRecoverableDeletedEntries(){
@@ -265,7 +287,7 @@ function getFirstActivePassage(){
 }
 
 function recordLocalSyncChange(reason = "local-change", timestamp = nowIso()){
-  if (reason === "ports-change") forgetSyncRecordMeta("global:ports");
+  if (suppressLocalSyncTracking) return;
   const pending = countPendingLocalChanges();
   saveLocalSyncStatus({
     status: pending > 0 ? "local-pending" : "local-only",
@@ -274,20 +296,37 @@ function recordLocalSyncChange(reason = "local-change", timestamp = nowIso()){
     pendingLocalChanges: pending
   });
   renderLocalSyncStatus();
+  scheduleAutoFullDataSync(reason);
+}
+
+function recordCompleteDataPackageChange(reason = "local-change", timestamp = nowIso()){
+  if (suppressLocalSyncTracking) return;
+  saveLocalSyncStatus({
+    status: "local-pending",
+    lastLocalChangeAt: timestamp,
+    lastLocalChangeReason: reason,
+    pendingLocalChanges: Math.max(1, countPendingLocalChanges())
+  });
+  renderLocalSyncStatus();
+  scheduleAutoFullDataSync(reason);
+}
+
+function withSyncTrackingSuppressed(fn){
+  const previous = suppressLocalSyncTracking;
+  suppressLocalSyncTracking = true;
+  try{
+    return fn();
+  }finally{
+    suppressLocalSyncTracking = previous;
+  }
 }
 
 function getLocalSyncSummary(){
   const status = loadLocalSyncStatus();
-  const pending = countPendingLocalChanges();
   const deleted = countRecoverableDeletedEntries();
-  if (status.pendingLocalChanges !== pending) {
-    status.pendingLocalChanges = pending;
-    status.status = pending > 0 ? "local-pending" : (status.status === "full-sync-ok" ? "full-sync-ok" : "local-only");
-    saveLocalSyncStatus(status);
-  }
   return {
     ...status,
-    pendingLocalChanges: pending,
+    pendingLocalChanges: Number(status.pendingLocalChanges || 0),
     recoverableDeletedEntries: deleted
   };
 }
@@ -301,6 +340,29 @@ function formatSyncStatusTime(value){
   }
 }
 
+function weatherAbbreviationsEnabled(){
+  return storage.getItem(WEATHER_ABBR_ENABLED_KEY) !== "0";
+}
+
+function saveWeatherAbbreviationsEnabled(enabled){
+  saveLocalStorageItem(WEATHER_ABBR_ENABLED_KEY, enabled ? "1" : "0", "weather abbreviations setting");
+}
+
+function updateAutoSyncFooterStatus(summary = null){
+  const el = document.getElementById("autoSyncFooterStatus");
+  if (!el) return;
+  const config = loadSyncConfig();
+  if (config.autoSyncEnabled !== true) {
+    el.textContent = "Auto-sync off";
+    return;
+  }
+  const status = summary || loadLocalSyncStatus();
+  const checkedAt = status.lastAutoSyncAttemptAt || status.lastAutoSyncAt || "";
+  el.textContent = checkedAt
+    ? `Auto-sync on · checked ${formatSyncStatusTime(checkedAt)}`
+    : "Auto-sync on · waiting";
+}
+
 function renderLocalSyncStatus(){
   const el = document.getElementById("syncStatusSummary");
   if (!el) return;
@@ -311,39 +373,66 @@ function renderLocalSyncStatus(){
   const lastCloudDeviceName = summary.lastObservedFullSyncDeviceName || summary.lastFullSyncDeviceName || summary.lastCloudBackupDeviceName || "";
   const lastCloudDeviceId = summary.lastObservedFullSyncDeviceId || summary.lastFullSyncDeviceId || summary.lastCloudBackupDeviceId || "";
   const cloudDeviceText = displayDeviceName(lastCloudDeviceName, lastCloudDeviceId);
-  const lastSyncText = formatSyncStatusTime(summary.lastSyncAt);
+  const autoSyncLastCheck = summary.lastAutoSyncAttemptAt || summary.lastAutoSyncAt || "";
+  const autoSyncText = config.autoSyncEnabled
+    ? `Auto-sync on${autoSyncLastCheck ? ` · Last check ${formatSyncStatusTime(autoSyncLastCheck)}` : ""}`
+    : "Auto-sync off";
   const hasConnection = Boolean(config.workerUrl && config.token);
-  let statusText = "Ready to sync";
-  let statusDetail = "Sync Now checks cloud first, then updates only the copy that needs it.";
+  const checkedText = summary.lastRemoteCheckAt ? formatSyncStatusTime(summary.lastRemoteCheckAt) : "Never";
+  let statusText = "No cloud copy";
+  let statusDetail = "Check cloud, then Sync will create the first cloud copy from this device.";
+  let nextAction = "Check or sync";
   if (!hasConnection) {
-    statusText = "Cloud sync not set up";
-    statusDetail = "Open connection settings and enter the sync details to use cloud sync.";
-  } else if (summary.lastRemoteStatus === "error") {
-    statusText = "Sync needs attention";
-    statusDetail = summary.lastSyncError || "The last cloud check did not complete.";
-  } else if (summary.status === "full-sync-ok" && summary.pendingLocalChanges === 0) {
+    statusText = "Offline / unable to check cloud";
+    statusDetail = "Cloud sync is not set up on this device.";
+    nextAction = "Enter connection settings";
+  } else if (summary.status === "offline" || summary.status === "unable-to-check-cloud") {
+    statusText = "Offline / unable to check cloud";
+    statusDetail = summary.lastSyncError || "The app could not reach cloud. Local work is still saved on this device.";
+    nextAction = "Try again when online";
+  } else if (summary.status === "sync-error") {
+    statusText = "Sync error";
+    statusDetail = summary.lastSyncError || "The last sync did not complete.";
+    nextAction = "Check cloud again";
+  } else if (summary.status === "cloud-changed" || summary.status === "decision-needed") {
+    statusText = summary.status === "decision-needed" ? "Decision needed" : "Cloud changed";
+    statusDetail = displayedCloudAt
+      ? `Cloud was last saved ${formatSyncStatusTime(displayedCloudAt)} by ${cloudDeviceText}. Choose which complete copy to keep.`
+      : "Cloud changed. Choose which complete copy to keep.";
+    nextAction = "Tap Sync and choose";
+  } else if (summary.status === "synced" && summary.pendingLocalChanges === 0) {
     statusText = "Synced";
-    statusDetail = summary.lastSyncAt
-      ? `This device was last synced ${lastSyncText}.`
+    statusDetail = displayedCloudAt
+      ? `Latest cloud save ${formatSyncStatusTime(displayedCloudAt)} by ${cloudDeviceText}.`
       : "This device matches the latest cloud copy.";
+    nextAction = "Nothing needed";
   } else if (summary.pendingLocalChanges > 0) {
-    statusText = "Ready to sync changes";
-    statusDetail = "Sync Now will check cloud first, then save this device's latest changes if it is safe to do so.";
+    statusText = "Local changes pending";
+    statusDetail = "This device has changes waiting to sync. Sync will check cloud before uploading.";
+    nextAction = "Check cloud, then upload if unchanged";
   } else if (displayedCloudAt) {
-    statusText = "Ready to sync";
+    statusText = "Cloud changed";
     statusDetail = `Latest cloud copy was saved ${formatSyncStatusTime(displayedCloudAt)}${cloudDeviceText ? ` by ${cloudDeviceText}` : ""}.`;
+    nextAction = "Choose which complete copy to keep";
   }
   el.innerHTML = `
     <div class="sync-overview-card">
-      <span>Cloud sync</span>
+      <span>Sync status</span>
       <strong>${escapeHtml(statusText)}</strong>
       <p>${escapeHtml(statusDetail)}</p>
     </div>
     <div class="sync-check-panel">
+      <div class="sync-status-grid">
+        <div><span>Last checked</span><strong>${escapeHtml(checkedText)}</strong></div>
+        <div><span>Last cloud save</span><strong>${escapeHtml(displayedCloudAt ? formatSyncStatusTime(displayedCloudAt) : "None")}</strong></div>
+        <div><span>Saved by</span><strong>${escapeHtml(displayedCloudAt ? cloudDeviceText : "None")}</strong></div>
+        <div><span>Next action</span><strong>${escapeHtml(nextAction)}</strong></div>
+      </div>
       <div class="st-action-row">
         <button type="button" id="syncPreviewBtn" class="btn btn-secondary">Check Cloud</button>
-        <button type="button" id="syncFullBtn" class="btn" data-sync-now-btn="1">Sync Now</button>
+        <button type="button" id="syncFullBtn" class="btn" data-sync-now-btn="1">Sync</button>
       </div>
+      <p class="hint">${escapeHtml(autoSyncText)}</p>
       <details class="sync-advanced">
         <summary>Connection settings</summary>
         <label class="sync-check-field">
@@ -358,18 +447,13 @@ function renderLocalSyncStatus(){
           <span>Sync token</span>
           <input id="syncWorkerToken" type="password" value="${escapeHtml(config.token)}" autocomplete="off" spellcheck="false">
         </label>
-      </details>
-      <details class="sync-advanced">
-        <summary>Recovery backups</summary>
-        <div class="st-action-row">
-          <button type="button" id="syncRefreshBackupsBtn" class="btn btn-secondary">Refresh Cloud Backups</button>
-        </div>
+        <label class="sync-check-field sync-check-option">
+          <span>Auto-sync</span>
+          <span><input id="syncAutoEnabled" type="checkbox"${config.autoSyncEnabled ? " checked" : ""}> Check and upload only when cloud has not changed</span>
+        </label>
       </details>
       <div id="syncPreviewResults" class="sync-preview-results">
-        <p class="hint">Cloud is treated as the main copy. Sync Now checks it first, then confirms before changing anything important.</p>
-      </div>
-      <div id="syncCloudBackups" class="sync-cloud-backups">
-        <p class="hint">Recovery backups are kept when the cloud copy is replaced. They can be downloaded or restored manually.</p>
+        <p class="hint">Sync treats the complete STEELER data backup as one package. No partial merge is performed.</p>
       </div>
       <p id="syncCheckMessage" class="hint">${escapeHtml(summary.lastSyncError || "Ready to sync.")}</p>
     </div>
@@ -389,6 +473,20 @@ function bindSyncStatusControls(){
     const saveName = () => saveDeviceName(deviceNameInput.value);
     deviceNameInput.addEventListener("change", saveName);
     deviceNameInput.addEventListener("blur", saveName);
+  }
+
+  const autoSyncInput = document.getElementById("syncAutoEnabled");
+  if (autoSyncInput && autoSyncInput.dataset.bound !== "1") {
+    autoSyncInput.dataset.bound = "1";
+    autoSyncInput.addEventListener("change", () => {
+      const currentConfig = loadSyncConfig();
+      saveSyncConfig({
+        ...currentConfig,
+        autoSyncEnabled: autoSyncInput.checked === true
+      });
+      updateAutoSyncFooterStatus();
+      if (autoSyncInput.checked) scheduleAutoFullDataSync("setting-enabled");
+    });
   }
 
   const refreshBtn = document.getElementById("syncRefreshBackupsBtn");
@@ -415,11 +513,13 @@ function getSavedSyncConnection(){
   const urlEl = document.getElementById("syncWorkerUrl");
   const tokenEl = document.getElementById("syncWorkerToken");
   const deviceNameEl = document.getElementById("syncDeviceName");
+  const autoSyncEl = document.getElementById("syncAutoEnabled");
   if (deviceNameEl) saveDeviceName(deviceNameEl.value);
   const currentConfig = loadSyncConfig();
   const config = saveSyncConfig({
     workerUrl: urlEl ? urlEl.value : currentConfig.workerUrl,
-    token: tokenEl ? tokenEl.value : currentConfig.token
+    token: tokenEl ? tokenEl.value : currentConfig.token,
+    autoSyncEnabled: autoSyncEl ? autoSyncEl.checked === true : currentConfig.autoSyncEnabled === true
   });
 
   if (!config.token) {
@@ -446,7 +546,7 @@ async function checkSyncWorkerStatus(){
   }
 
   if (btn) btn.disabled = true;
-  setSyncCheckMessage("Checking staging Worker...");
+  setSyncCheckMessage("Checking cloud...");
   const checkedAt = nowIso();
 
   try{
@@ -513,41 +613,19 @@ function latestPassageTimestamp(p){
 }
 
 function loadSyncRecordMeta(){
-  try{
-    const parsed = JSON.parse(storage.getItem(SYNC_RECORD_META_KEY) || "{}");
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-  }catch{
-    return {};
-  }
+  return {};
 }
 
 function saveSyncRecordMeta(meta){
-  try{
-    storage.setItem(SYNC_RECORD_META_KEY, JSON.stringify(meta && typeof meta === "object" ? meta : {}));
-  }catch(e){
-    console.warn("Could not save sync record metadata", e);
-  }
+  return meta;
 }
 
 function rememberSyncRecordMeta(record){
-  const recordId = String(record?.recordId || "");
-  const clientUpdatedAt = String(record?.clientUpdatedAt || "");
-  if (!recordId || !isValidIsoString(clientUpdatedAt)) return;
-  const meta = loadSyncRecordMeta();
-  meta[recordId] = {
-    clientUpdatedAt,
-    lastChangedDeviceId: String(record?.lastChangedDeviceId || "")
-  };
-  saveSyncRecordMeta(meta);
+  return record;
 }
 
 function forgetSyncRecordMeta(recordId){
-  const cleanRecordId = String(recordId || "");
-  if (!cleanRecordId) return;
-  const meta = loadSyncRecordMeta();
-  if (!meta[cleanRecordId]) return;
-  delete meta[cleanRecordId];
-  saveSyncRecordMeta(meta);
+  return recordId;
 }
 
 function createSyncRecord(recordId, recordType, payload, timestamp, lastChangedDeviceId = getOrCreateDeviceId()){
@@ -675,146 +753,12 @@ function markReceivedRecordClean(record){
   return record;
 }
 
-function cloneDailySummaries(days){
-  return (Array.isArray(days) ? days : []).map((day) => ({ ...day }));
-}
-
-function dailySummaryContentScore(days){
-  return (Array.isArray(days) ? days : []).reduce((score, day) => {
-    const date = String(day?.date || "").trim();
-    const fee = String(day?.fee || "").trim();
-    const notes = String(day?.notes || "").trim();
-    return score + (date ? 1 : 0) + (fee ? 2 : 0) + (notes ? 3 + Math.min(notes.length, 200) : 0);
-  }, 0);
-}
-
-function localDailySummariesAreRicher(localDailySummaries, remoteDailySummaries){
-  if (!localDailySummaries.length) return false;
-  if (!remoteDailySummaries.length) return true;
-  return dailySummaryContentScore(localDailySummaries) > dailySummaryContentScore(remoteDailySummaries)
-    && localDailySummaries.length >= remoteDailySummaries.length;
-}
-
-function detailedPlanContentScore(detailed){
-  if (!detailed || typeof detailed !== "object") return 0;
-  const waypoints = Array.isArray(detailed.waypoints) ? detailed.waypoints : [];
-  const waypointScore = waypoints.reduce((score, wp) => {
-    if (!wp || typeof wp !== "object") return score;
-    const textFields = [
-      wp.name, wp.coords, wp.lat, wp.lon, wp.position, wp.time, wp.actualTime,
-      wp.course, wp.distance, wp.plannedSpeed, wp.tideKt, wp.tideDir,
-      wp.manualDistToNext
-    ];
-    return score + textFields.reduce((sum, value) => sum + (String(value || "").trim() ? 1 : 0), 1);
-  }, 0);
-  const notesScore = ["hazards", "portsOfRefuge", "crewWelfare"].reduce((score, key) => {
-    const value = String(detailed[key] || "").trim();
-    return score + (value ? 3 + Math.min(value.length, 200) : 0);
-  }, 0);
-  return waypointScore + notesScore;
-}
-
-function detailedPlanCollectionContentScore(plan){
-  if (!plan || typeof plan !== "object") return 0;
-  const singleScore = detailedPlanContentScore(plan.detailed);
-  const legsScore = (Array.isArray(plan.detailedLegs) ? plan.detailedLegs : [])
-    .reduce((score, detailed) => score + detailedPlanContentScore(detailed), 0);
-  return singleScore + legsScore;
-}
-
-function cloneDppPlanFields(plan){
-  const source = plan && typeof plan === "object" ? plan : {};
-  return {
-    detailed: cloneJsonSafe(source.detailed, undefined),
-    detailedLegs: cloneJsonSafe(source.detailedLegs, undefined),
-    detailedLegIndex: source.detailedLegIndex
-  };
-}
-
-function mergeReceivedPlanSafeguards(remotePlan, localPlan){
-  const mergedPlan = {
-    ...(remotePlan || {})
-  };
-  const preserved = [];
-
-  const remoteDailySummaries = Array.isArray(remotePlan?.dailySummaries)
-    ? remotePlan.dailySummaries
-    : [];
-  const localDailySummaries = Array.isArray(localPlan?.dailySummaries)
-    ? localPlan.dailySummaries
-    : [];
-
-  if (localDailySummariesAreRicher(localDailySummaries, remoteDailySummaries)) {
-    mergedPlan.dailySummaries = cloneDailySummaries(localDailySummaries);
-    preserved.push("Daily Summary");
-  }
-
-  const remoteDppScore = detailedPlanCollectionContentScore(remotePlan);
-  const localDppScore = detailedPlanCollectionContentScore(localPlan);
-  if (localDppScore > 0 && remoteDppScore === 0) {
-    const dppFields = cloneDppPlanFields(localPlan);
-    if (dppFields.detailed !== undefined) mergedPlan.detailed = dppFields.detailed;
-    if (dppFields.detailedLegs !== undefined) mergedPlan.detailedLegs = dppFields.detailedLegs;
-    if (dppFields.detailedLegIndex !== undefined) mergedPlan.detailedLegIndex = dppFields.detailedLegIndex;
-    preserved.push("DPP");
-  }
-
-  return { plan: mergedPlan, preserved };
-}
-
-function mergeReceivedPassageWithLocalSafeguards(remotePassage, localPassage){
-  if (!remotePassage || typeof remotePassage !== "object") return { passage: remotePassage, preserved: [] };
-  if (!localPassage || typeof localPassage !== "object") return { passage: remotePassage, preserved: [] };
-
-  const merged = {
-    ...remotePassage,
-    plan: {
-      ...(remotePassage.plan || {})
-    }
-  };
-  const planMerge = mergeReceivedPlanSafeguards(remotePassage.plan || {}, localPassage.plan || {});
-  merged.plan = planMerge.plan;
-
-  if (planMerge.preserved.length) {
-    const changedAt = nowIso();
-    merged.updatedAt = changedAt;
-    merged.dirtyAt = changedAt;
-    merged.syncDirty = true;
-    merged.syncStatus = "pending";
-  }
-
-  return { passage: merged, preserved: planMerge.preserved };
-}
-
 function prepareCloudBackupForRestoreWithSafeguards(backup){
-  const prepared = cloneJsonSafe(backup, null);
-  const preservedPassageIds = new Set();
-  const preservedLabels = new Set();
-  if (!prepared?.data || !Array.isArray(prepared.data.passages)) {
-    return { backup, preservedPassageIds, preservedLabels };
-  }
-
-  const localById = new Map((Array.isArray(passages) ? passages : [])
-    .filter(p => p?.id)
-    .map(p => [String(p.id), p]));
-  prepared.data.passages = prepared.data.passages.map((remotePassage) => {
-    const localPassage = remotePassage?.id ? localById.get(String(remotePassage.id)) : null;
-    const result = mergeReceivedPassageWithLocalSafeguards(remotePassage, localPassage);
-    if (result.preserved.length && remotePassage?.id) {
-      preservedPassageIds.add(String(remotePassage.id));
-      result.preserved.forEach(label => preservedLabels.add(label));
-    }
-    return result.passage;
-  });
-
-  return { backup: prepared, preservedPassageIds, preservedLabels };
+  return { backup, preservedPassageIds: new Set(), preservedLabels: new Set() };
 }
 
 function mergeReceivedPassageWithLocal(remotePassage, localPassage){
-  if (!remotePassage || typeof remotePassage !== "object") return remotePassage;
-  if (!localPassage || typeof localPassage !== "object") return remotePassage;
-
-  return mergeReceivedPassageWithLocalSafeguards(remotePassage, localPassage).passage;
+  return remotePassage;
 }
 
 function applySyncRecord(record){
@@ -876,7 +820,7 @@ function applySyncRecord(record){
     if (data && typeof data === "object") {
       if (data.theme) applyTheme(data.theme);
       if (data.logSplitRatio !== undefined && data.logSplitRatio !== null) {
-        storage.setItem(LOG_SPLIT_RATIO_KEY, String(data.logSplitRatio));
+        saveLocalStorageItem(LOG_SPLIT_RATIO_KEY, String(data.logSplitRatio), "log split setting");
       }
       return true;
     }
@@ -1029,6 +973,72 @@ function stableComparableJson(value){
     return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableComparableJson(value[key])}`).join(",")}}`;
   }
   return JSON.stringify(value ?? "");
+}
+
+function simpleHashString(value){
+  const str = String(value || "");
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < str.length; i += 1) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return `${(h2 >>> 0).toString(16).padStart(8, "0")}${(h1 >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+function fullDataBackupPackageHash(backup){
+  return simpleHashString(stableComparableJson(comparableBackupData(backup)));
+}
+
+function summariseFullDataBackupPackage(backup){
+  const data = backup?.data || {};
+  const passageList = Array.isArray(data.passages) ? data.passages : [];
+  let activePassages = 0;
+  let logEntries = 0;
+  let dailySummaryRows = 0;
+  let dailySummaryRowsWithContent = 0;
+  let dppWaypoints = 0;
+
+  passageList.forEach((passage) => {
+    if (!passage || passage.deleted === true) return;
+    activePassages += 1;
+    if (Array.isArray(passage.entries)) {
+      logEntries += passage.entries.filter((entry) => entry && entry.deleted !== true).length;
+    }
+    const dailySummaries = Array.isArray(passage.plan?.dailySummaries) ? passage.plan.dailySummaries : [];
+    dailySummaryRows += dailySummaries.length;
+    dailySummaryRowsWithContent += dailySummaries.filter((day) => {
+      if (!day || typeof day !== "object") return false;
+      return Object.values(day).some((value) => String(value ?? "").trim());
+    }).length;
+    const detailedPlans = [];
+    if (passage.plan?.detailed) detailedPlans.push(passage.plan.detailed);
+    if (Array.isArray(passage.plan?.detailedLegs)) detailedPlans.push(...passage.plan.detailedLegs);
+    detailedPlans.forEach((plan) => {
+      if (Array.isArray(plan?.waypoints)) dppWaypoints += plan.waypoints.length;
+    });
+  });
+
+  return {
+    hash: backup ? fullDataBackupPackageHash(backup) : "",
+    passages: passageList.length,
+    activePassages,
+    logEntries,
+    dailySummaryRows,
+    dailySummaryRowsWithContent,
+    dppWaypoints,
+    ports: Array.isArray(data.knownPorts?.all) ? data.knownPorts.all.length : 0,
+    dppTemplates: Array.isArray(data.dppTemplates) ? data.dppTemplates.length : 0
+  };
+}
+
+function formatFullDataPackageSummary(summary){
+  if (!summary) return "No package";
+  const shortHash = summary.hash ? summary.hash.slice(0, 8) : "none";
+  return `${summary.activePassages}/${summary.passages} passages · ${summary.logEntries} log entries · ${summary.dailySummaryRows} Daily Summary rows (${summary.dailySummaryRowsWithContent} with content) · ${summary.dppWaypoints} DPP waypoints · ${summary.ports} ports · hash ${shortHash}`;
 }
 
 function summariseNamedListDifference(label, localItems, remoteItems, options = {}){
@@ -1193,6 +1203,7 @@ function getFullDataBackupFromRecord(record){
 function createFullDataSyncRecord(backupPayload, timestamp = nowIso()){
   const deviceId = getOrCreateDeviceId();
   const deviceName = getDeviceName();
+  const packageHash = fullDataBackupPackageHash(backupPayload);
   return {
     recordId: FULL_DATA_SYNC_RECORD_ID,
     recordType: FULL_DATA_SYNC_RECORD_TYPE,
@@ -1208,6 +1219,7 @@ function createFullDataSyncRecord(backupPayload, timestamp = nowIso()){
       appVersion: APP_VERSION,
       deviceId,
       deviceName,
+      packageHash,
       backup: backupPayload
     }
   };
@@ -1280,6 +1292,8 @@ function describeFullDataCloudRecord(cloud){
   const deviceId = record?.lastChangedDeviceId || record?.payload?.deviceId || backup?.exportedByDeviceId || "";
   const deviceName = record?.lastChangedDeviceName || record?.payload?.deviceName || backup?.exportedByDeviceName || "";
   const passageCount = Array.isArray(backup?.data?.passages) ? backup.data.passages.length : 0;
+  const packageHash = record?.payload?.packageHash || (backup ? fullDataBackupPackageHash(backup) : "");
+  const packageSummary = backup ? summariseFullDataBackupPackage(backup) : null;
   return {
     revision: Number(record?.serverRevision || cloud?.serverRevision || 0),
     updatedAt,
@@ -1287,6 +1301,8 @@ function describeFullDataCloudRecord(cloud){
     deviceName,
     displayDevice: displayDeviceName(deviceName, deviceId),
     appVersion: record?.payload?.appVersion || backup?.appVersion || "",
+    packageHash,
+    packageSummary,
     passageCount,
     text: record
       ? `Cloud revision ${Number(record.serverRevision || cloud?.serverRevision || 0)} · ${formatSyncStatusTime(updatedAt)} · ${displayDeviceName(deviceName, deviceId)}`
@@ -1309,11 +1325,6 @@ function comparableBackupData(backup){
   return removeBackupComparisonNoise(cloneJsonSafe(backup?.data || {}, {}));
 }
 
-function fullDataBackupsMatch(localBackup, cloudBackup){
-  if (!localBackup || !cloudBackup) return false;
-  return stableComparableJson(comparableBackupData(localBackup)) === stableComparableJson(comparableBackupData(cloudBackup));
-}
-
 function renderFullDataCloudPreview(cloud, note = ""){
   const el = document.getElementById("syncPreviewResults");
   if (!el) return;
@@ -1324,7 +1335,7 @@ function renderFullDataCloudPreview(cloud, note = ""){
         <div class="sync-overview-card">
           <span>Cloud copy</span>
           <strong>None yet</strong>
-          <p>${escapeHtml(note || "Sync Now will create the first cloud copy from this device.")}</p>
+          <p>${escapeHtml(note || "Sync will create the first cloud copy from this device.")}</p>
         </div>
       </div>
     `;
@@ -1335,7 +1346,7 @@ function renderFullDataCloudPreview(cloud, note = ""){
       <div class="sync-status-grid">
         <div><span>Last cloud save</span><strong>${escapeHtml(formatSyncStatusTime(summary.updatedAt))}</strong></div>
         <div><span>Saved by</span><strong>${escapeHtml(summary.displayDevice)}</strong></div>
-        <div><span>Cloud data</span><strong>${summary.passageCount} passage${summary.passageCount === 1 ? "" : "s"}</strong></div>
+        <div><span>Cloud data</span><strong>${escapeHtml(formatFullDataPackageSummary(summary.packageSummary))}</strong></div>
       </div>
       <p class="hint">${escapeHtml(note || "Check only. No data was uploaded, downloaded or changed.")}</p>
     </div>
@@ -1350,6 +1361,10 @@ function saveFullDataCloudStatus(status, cloud, extra = {}){
     lastRemoteCheckAt: extra.checkedAt || nowIso(),
     lastRemoteRevision: summary.revision,
     lastFullSyncRevision: summary.revision,
+    lastSyncedPackageHash: extra.localPackageHash || extra.packageHash || summary.packageHash || "",
+    lastSyncedLocalPackageHash: extra.localPackageHash || extra.packageHash || summary.packageHash || "",
+    lastSyncedCloudPackageHash: extra.cloudPackageHash || summary.packageHash || extra.packageHash || "",
+    lastObservedFullSyncRevision: summary.revision,
     lastFullSyncAt: summary.updatedAt || extra.checkedAt || nowIso(),
     lastFullSyncDeviceId: summary.deviceId || "",
     lastFullSyncDeviceName: summary.deviceName || "",
@@ -1363,10 +1378,27 @@ function saveFullDataCloudStatus(status, cloud, extra = {}){
 function cloudCopyChangedSinceLastSync(cloud){
   if (!cloud?.record) return false;
   const status = loadLocalSyncStatus();
-  const lastSeen = Number(status.lastFullSyncRevision || 0);
-  const cloudRevision = Number(cloud.record.serverRevision || 0);
-  if (!lastSeen) return true;
-  return cloudRevision > lastSeen;
+  const lastSyncedHash = String(status.lastSyncedCloudPackageHash || status.lastSyncedPackageHash || "");
+  const cloudHash = describeFullDataCloudRecord(cloud).packageHash || "";
+  if (!lastSyncedHash) return true;
+  return cloudHash !== lastSyncedHash;
+}
+
+function saveObservedFullDataCloudStatus(status, cloud, extra = {}){
+  const summary = describeFullDataCloudRecord(cloud);
+  return saveLocalSyncStatus({
+    status,
+    lastRemoteStatus: "ok",
+    lastRemoteCheckAt: extra.checkedAt || nowIso(),
+    lastRemoteRevision: summary.revision,
+    lastObservedFullSyncRevision: summary.revision,
+    lastObservedFullSyncAt: summary.updatedAt || "",
+    lastObservedFullSyncDeviceId: summary.deviceId || "",
+    lastObservedFullSyncDeviceName: summary.deviceName || "",
+    lastObservedFullSyncAppVersion: summary.appVersion || "",
+    lastSyncError: "",
+    ...extra
+  });
 }
 
 function clearAllLocalSyncDirty(options = {}){
@@ -1403,26 +1435,37 @@ function clearAllLocalSyncDirty(options = {}){
       portsChanged = true;
     }
   });
-  if (passagesChanged) savePassages();
+  if (passagesChanged) withSyncTrackingSuppressed(() => savePassages());
   if (portsChanged) {
-    saveLocalStorageItem(PORTS_KEY, JSON.stringify({ all: knownPorts, recent: recentPorts }), "ports");
+    withSyncTrackingSuppressed(() => saveLocalStorageItem(PORTS_KEY, JSON.stringify({ all: knownPorts, recent: recentPorts }), "ports"));
     refreshPortUI();
   }
 }
 
-function chooseFullSyncConflictAction(cloud){
+function chooseFullSyncConflictAction(cloud, options = {}){
   const summary = describeFullDataCloudRecord(cloud);
+  const localBackup = createDataBackupPayload();
+  const localSummary = summariseFullDataBackupPackage(localBackup);
+  const localDevice = getDeviceName();
+  const intro = options.auto
+    ? "Auto-sync found a different cloud copy and needs you to choose what to do."
+    : "Cloud changed since this device last synced.";
   return new Promise((resolve) => {
     showModal({
-      title: "Cloud Copy Changed",
+      title: "Sync Decision Needed",
       hideButtons: true,
       bodyHtml: `
-        <p>Cloud was last updated by <strong>${escapeHtml(summary.displayDevice)}</strong>.</p>
-        <p>${escapeHtml(formatSyncStatusTime(summary.updatedAt))} · Revision ${summary.revision}</p>
-        <p>Choose which complete STEELER data copy to keep.</p>
+        <p>${escapeHtml(intro)}</p>
+        <p>Cloud was last saved <strong>${escapeHtml(formatSyncStatusTime(summary.updatedAt))}</strong> by <strong>${escapeHtml(summary.displayDevice)}</strong>.</p>
+        <p>This device is <strong>${escapeHtml(localDevice)}</strong>.</p>
+        <div class="sync-status-grid">
+          <div><span>Cloud copy</span><strong>${escapeHtml(formatFullDataPackageSummary(summary.packageSummary))}</strong></div>
+          <div><span>This device</span><strong>${escapeHtml(formatFullDataPackageSummary(localSummary))}</strong></div>
+        </div>
+        <p>Choose which complete STEELER data package to keep. No partial merge will be performed.</p>
         <div class="st-action-row">
-          <button type="button" id="syncKeepThisDeviceBtn" class="btn">Keep This Device</button>
-          <button type="button" id="syncUseCloudCopyBtn" class="btn btn-secondary">Use Cloud Copy</button>
+          <button type="button" id="syncUseCloudCopyBtn" class="btn">Use Cloud Copy on This Device</button>
+          <button type="button" id="syncKeepThisDeviceBtn" class="btn btn-secondary">Keep This Device and Replace Cloud</button>
           <button type="button" id="syncCancelChoiceBtn" class="btn btn-secondary">Cancel</button>
         </div>
       `
@@ -1438,13 +1481,10 @@ function chooseFullSyncConflictAction(cloud){
 }
 
 async function uploadFullDataCloudCopy(connection, previousCloud, syncedAt){
-  const previousStatus = loadLocalSyncStatus();
   const localBackup = createDataBackupPayload();
-  const records = [];
-  const previousBackup = getFullDataBackupFromRecord(previousCloud?.record);
-  if (previousBackup) records.push(createCloudBackupRecord(previousBackup));
+  const localPackageHash = fullDataBackupPackageHash(localBackup);
   const currentRecord = createFullDataSyncRecord(localBackup, syncedAt);
-  records.push(currentRecord);
+  const records = [currentRecord];
   const pushed = await pushCloudSyncRecords(connection, records);
   const acceptedCurrent = pushed.accepted.find((record) => record.recordId === FULL_DATA_SYNC_RECORD_ID);
   const cloud = {
@@ -1456,13 +1496,15 @@ async function uploadFullDataCloudCopy(connection, previousCloud, syncedAt){
     serverRevision: acceptedCurrent?.serverRevision || pushed.serverRevision || previousCloud?.serverRevision || 0
   };
   clearAllLocalSyncDirty();
-  saveFullDataCloudStatus("full-sync-ok", cloud, {
+  saveFullDataCloudStatus("synced", cloud, {
     checkedAt: syncedAt,
     lastSyncAt: syncedAt,
-    lastCloudBackupAt: previousBackup ? syncedAt : previousStatus.lastCloudBackupAt || "",
-    lastCloudBackupRecordId: previousBackup ? records[0].recordId : previousStatus.lastCloudBackupRecordId || "",
-    lastSyncDirection: "upload"
+    lastSyncDirection: "upload",
+    pendingLocalChanges: 0,
+    localPackageHash,
+    cloudPackageHash: localPackageHash
   });
+  setSyncCheckMessage(`Uploaded and verified: ${formatFullDataPackageSummary(summariseFullDataBackupPackage(localBackup))}.`);
   return cloud;
 }
 
@@ -1471,26 +1513,45 @@ async function applyFullDataCloudCopy(cloud, syncedAt){
   if (!backup || backup.format !== DATA_BACKUP_FORMAT || !backup.data || !Array.isArray(backup.data.passages)) {
     throw new Error("Cloud copy is not a valid STEELER data backup.");
   }
-  downloadJsonPayload(createDataBackupPayload(), "STEELER-Before-cloud-sync-backup");
-  const prepared = prepareCloudBackupForRestoreWithSafeguards(backup);
-  const restored = restoreDataBackupObject(prepared.backup, {
+  const cloudSummary = describeFullDataCloudRecord(cloud);
+  const expectedHash = cloudSummary.packageHash || fullDataBackupPackageHash(backup);
+  const expectedPackageSummary = summariseFullDataBackupPackage(backup);
+  const restored = withSyncTrackingSuppressed(() => restoreDataBackupObject(backup, {
     skipConfirm: true,
-    successMessage: prepared.preservedPassageIds.size
-      ? "Cloud copy applied. Richer local Daily Summary or DPP details were preserved."
-      : "Cloud copy applied successfully."
-  });
+    silent: true,
+    successMessage: "Cloud copy applied successfully."
+  }));
   if (!restored) throw new Error("Cloud copy was not applied.");
-  clearAllLocalSyncDirty({ preservePassageIds: prepared.preservedPassageIds });
-  const preservedLabels = [...prepared.preservedLabels].join(" and ");
-  saveFullDataCloudStatus(prepared.preservedPassageIds.size ? "local-pending" : "full-sync-ok", cloud, {
+  clearAllLocalSyncDirty();
+  const restoredBackup = withSyncTrackingSuppressed(() => createDataBackupPayload({ flush: false }));
+  const restoredHash = fullDataBackupPackageHash(restoredBackup);
+  const restoredPackageSummary = summariseFullDataBackupPackage(restoredBackup);
+  if (restoredHash !== expectedHash) {
+    const message =
+      "Cloud copy was applied, but verification failed. " +
+      `Cloud package: ${formatFullDataPackageSummary(expectedPackageSummary)}. ` +
+      `This device after restore: ${formatFullDataPackageSummary(restoredPackageSummary)}.`;
+    saveLocalSyncStatus({
+      status: "sync-error",
+      lastRemoteStatus: "error",
+      lastRemoteCheckAt: syncedAt,
+      lastSyncError: message,
+      lastSyncedCloudPackageHash: expectedHash,
+      lastSyncedLocalPackageHash: restoredHash
+    });
+    throw new Error(message);
+  }
+  saveFullDataCloudStatus("synced", cloud, {
     checkedAt: syncedAt,
     lastSyncAt: syncedAt,
-    lastSyncDirection: prepared.preservedPassageIds.size ? "download-preserved" : "download",
-    pendingLocalChanges: countPendingLocalChanges(),
-    lastSyncError: prepared.preservedPassageIds.size
-      ? `Cloud copy applied; richer local ${preservedLabels || "passage"} details were preserved and need syncing.`
-      : ""
+    lastSyncDirection: "download",
+    pendingLocalChanges: 0,
+    localPackageHash: restoredHash,
+    cloudPackageHash: expectedHash,
+    lastSyncError: ""
   });
+  setSyncCheckMessage(`Cloud copy applied and verified: ${formatFullDataPackageSummary(restoredPackageSummary)}.`);
+  return restoredPackageSummary;
 }
 
 async function checkFullDataCloudSync(){
@@ -1508,36 +1569,47 @@ async function checkFullDataCloudSync(){
     const cloud = await fetchCurrentFullDataCloudRecord(connection);
     const summary = describeFullDataCloudRecord(cloud);
     const localBackup = createDataBackupPayload();
-    const localMatchesCloud = Boolean(cloud.record && fullDataBackupsMatch(localBackup, cloud.backup));
-    const previousStatus = loadLocalSyncStatus();
-    saveLocalSyncStatus({
-      status: localMatchesCloud ? "full-sync-ok" : "full-sync-check-ok",
-      lastRemoteStatus: "ok",
-      lastRemoteCheckAt: checkedAt,
-      lastRemoteRevision: summary.revision,
-      lastFullSyncRevision: localMatchesCloud ? summary.revision : previousStatus.lastFullSyncRevision || "",
-      lastFullSyncAt: localMatchesCloud ? summary.updatedAt || checkedAt : previousStatus.lastFullSyncAt || "",
-      lastFullSyncDeviceId: localMatchesCloud ? summary.deviceId || "" : previousStatus.lastFullSyncDeviceId || "",
-      lastFullSyncDeviceName: localMatchesCloud ? summary.deviceName || "" : previousStatus.lastFullSyncDeviceName || "",
-      lastFullSyncAppVersion: localMatchesCloud ? summary.appVersion || "" : previousStatus.lastFullSyncAppVersion || "",
-      lastObservedFullSyncRevision: summary.revision,
-      lastObservedFullSyncAt: summary.updatedAt || "",
-      lastObservedFullSyncDeviceId: summary.deviceId || "",
-      lastObservedFullSyncDeviceName: summary.deviceName || "",
-      lastObservedFullSyncAppVersion: summary.appVersion || "",
-      checkedAt,
-      lastSyncAt: localMatchesCloud ? checkedAt : previousStatus.lastSyncAt || "",
-      lastSyncDirection: localMatchesCloud ? "matched" : previousStatus.lastSyncDirection || "",
-      lastSyncError: ""
-    });
+    const localHash = fullDataBackupPackageHash(localBackup);
+    const localMatchesCloud = Boolean(cloud.record && localHash === summary.packageHash);
+    const status = loadLocalSyncStatus();
+    const lastLocalHash = String(status.lastSyncedLocalPackageHash || status.lastSyncedPackageHash || "");
+    const lastCloudHash = String(status.lastSyncedCloudPackageHash || status.lastSyncedPackageHash || "");
+    const localChanged = lastLocalHash ? localHash !== lastLocalHash : !localMatchesCloud;
+    const cloudChanged = Boolean(cloud.record && (lastCloudHash ? summary.packageHash !== lastCloudHash : !localMatchesCloud));
+    const unmatchedKnownBaseline = Boolean(cloud.record && !localMatchesCloud && !localChanged && !cloudChanged);
+    if (localMatchesCloud) {
+      clearAllLocalSyncDirty();
+      saveFullDataCloudStatus("synced", cloud, {
+        checkedAt,
+        lastSyncAt: checkedAt,
+        lastSyncDirection: "matched",
+        pendingLocalChanges: 0,
+        localPackageHash: localHash,
+        cloudPackageHash: summary.packageHash
+      });
+    } else if (!cloud.record) {
+      saveObservedFullDataCloudStatus("no-cloud-copy", cloud, {
+        checkedAt,
+        localPackageHash: localHash,
+        pendingLocalChanges: 1
+      });
+    } else {
+      saveObservedFullDataCloudStatus((cloudChanged || unmatchedKnownBaseline) ? "decision-needed" : (localChanged ? "local-pending" : "sync-error"), cloud, {
+        checkedAt,
+        localPackageHash: localHash,
+        pendingLocalChanges: localChanged ? 1 : 0
+      });
+    }
     renderLocalSyncStatus();
-    renderFullDataCloudPreview(cloud, localMatchesCloud ? "This device already matches the cloud copy." : "");
+    renderFullDataCloudPreview(cloud, localMatchesCloud
+      ? "This device already matches the cloud copy."
+      : "This device and cloud do not match. Tap Sync and choose which complete copy to keep.");
     setSyncCheckMessage(cloud.record
-      ? (localMatchesCloud ? "This device already matches the cloud copy." : `${summary.text}. No data changed.`)
-      : "No cloud copy found yet. Sync Now will create one from this device.");
+      ? (localMatchesCloud ? "This device already matches the cloud copy." : `${summary.text}. This device and cloud do not match.`)
+      : "No cloud copy found yet. Sync will create one from this device.");
   }catch(e){
     saveLocalSyncStatus({
-      status: "full-sync-check-error",
+      status: "unable-to-check-cloud",
       lastRemoteStatus: "error",
       lastRemoteCheckAt: checkedAt,
       lastSyncError: e && e.message ? e.message : String(e || "Cloud check failed")
@@ -1555,28 +1627,40 @@ function setFullDataSyncBusy(isBusy){
   });
 }
 
-async function runFullDataCloudSync(){
+async function runFullDataCloudSync(options = {}){
+  const isAutoSync = options.auto === true;
   const connection = getSavedSyncConnection();
   if (connection.error) {
     setSyncCheckMessage(connection.error);
-    alert(connection.error);
+    if (!isAutoSync) alert(connection.error);
     return;
   }
   setFullDataSyncBusy(true);
-  setSyncCheckMessage("Checking cloud copy before sync...");
+  setSyncCheckMessage(isAutoSync ? "Auto-sync checking cloud copy..." : "Checking cloud copy before sync...");
   const syncedAt = nowIso();
 
   try{
     const cloud = await fetchCurrentFullDataCloudRecord(connection);
+    const previousStatus = loadLocalSyncStatus();
     const localBackup = createDataBackupPayload();
-    const localMatchesCloud = Boolean(cloud.record && fullDataBackupsMatch(localBackup, cloud.backup));
+    const localHash = fullDataBackupPackageHash(localBackup);
+    const cloudSummary = describeFullDataCloudRecord(cloud);
+    const localMatchesCloud = Boolean(cloud.record && localHash === cloudSummary.packageHash);
+    const lastLocalHash = String(previousStatus.lastSyncedLocalPackageHash || previousStatus.lastSyncedPackageHash || "");
+    const lastCloudHash = String(previousStatus.lastSyncedCloudPackageHash || previousStatus.lastSyncedPackageHash || "");
+    const localChanged = lastLocalHash ? localHash !== lastLocalHash : !localMatchesCloud;
+    const cloudChanged = Boolean(cloud.record && (lastCloudHash ? cloudSummary.packageHash !== lastCloudHash : !localMatchesCloud));
+    const unmatchedKnownBaseline = Boolean(cloud.record && !localMatchesCloud && !localChanged && !cloudChanged);
     renderFullDataCloudPreview(cloud, localMatchesCloud ? "This device already matches the cloud copy." : "");
     if (cloud.record && localMatchesCloud) {
       clearAllLocalSyncDirty();
-      saveFullDataCloudStatus("full-sync-ok", cloud, {
+      saveFullDataCloudStatus("synced", cloud, {
         checkedAt: syncedAt,
         lastSyncAt: syncedAt,
-        lastSyncDirection: "matched"
+        lastSyncDirection: "matched",
+        pendingLocalChanges: 0,
+        localPackageHash: localHash,
+        cloudPackageHash: cloudSummary.packageHash
       });
       renderLocalSyncStatus();
       renderFullDataCloudPreview(cloud, "This device already matches the cloud copy.");
@@ -1585,13 +1669,31 @@ async function runFullDataCloudSync(){
     }
 
     let choice = "local";
-    if (cloudCopyChangedSinceLastSync(cloud)) {
-      choice = await chooseFullSyncConflictAction(cloud);
+    if (cloudChanged || unmatchedKnownBaseline) {
+      saveObservedFullDataCloudStatus("decision-needed", cloud, { checkedAt: syncedAt });
+      renderLocalSyncStatus();
+      if (isAutoSync) {
+        renderFullDataCloudPreview(cloud, "This device and cloud do not match. Auto-sync needs your decision.");
+        setSyncCheckMessage("Auto-sync found that this device and cloud do not match. Choose which complete copy to keep.");
+      }
+      choice = await chooseFullSyncConflictAction(cloud, { auto: isAutoSync });
       if (choice === "cancel") {
+        saveObservedFullDataCloudStatus("decision-needed", cloud, { checkedAt: syncedAt });
+        renderLocalSyncStatus();
         setSyncCheckMessage("Sync cancelled. Nothing changed.");
         return;
       }
     } else if (!cloud.record) {
+      saveObservedFullDataCloudStatus("no-cloud-copy", cloud, {
+        checkedAt: syncedAt,
+        localPackageHash: localHash,
+        pendingLocalChanges: 1
+      });
+      renderLocalSyncStatus();
+      if (isAutoSync) {
+        setSyncCheckMessage("Auto-sync skipped. Tap Sync to create the first cloud copy from this device.");
+        return;
+      }
       const ok = confirm(
         "Create the first cloud copy?\n\n" +
         "This will save this device's complete STEELER logbook to cloud so your other devices can use it."
@@ -1601,34 +1703,47 @@ async function runFullDataCloudSync(){
         return;
       }
     } else {
-      const ok = confirm(
-        "Save this device's latest changes to cloud?\n\n" +
-        "Cloud will remain the main copy. The previous cloud copy will be kept in recovery backups."
-      );
-      if (!ok) {
-        setSyncCheckMessage("Sync cancelled. Nothing changed.");
-        return;
+      saveObservedFullDataCloudStatus(localChanged ? "local-pending" : "synced", cloud, {
+        checkedAt: syncedAt,
+        localPackageHash: localHash,
+        pendingLocalChanges: localChanged ? 1 : 0
+      });
+      renderLocalSyncStatus();
+      if (isAutoSync) {
+        if (!localChanged) {
+          renderFullDataCloudPreview(cloud, "Auto-sync checked cloud. No local changes were uploaded.");
+          setSyncCheckMessage("Auto-sync checked cloud. No local changes were uploaded.");
+          return;
+        }
+      } else {
+        const ok = confirm(
+          "Save this device's latest changes to cloud?\n\n" +
+          "This device's complete STEELER data package will replace the current cloud copy."
+        );
+        if (!ok) {
+          setSyncCheckMessage("Sync cancelled. Nothing changed.");
+          return;
+        }
       }
     }
 
     if (choice === "cloud") {
       setSyncCheckMessage("Applying cloud copy to this device...");
-      await applyFullDataCloudCopy(cloud, syncedAt);
+      const restoredPackageSummary = await applyFullDataCloudCopy(cloud, syncedAt);
       renderLocalSyncStatus();
-      renderFullDataCloudPreview(cloud, "Cloud copy applied to this device. A safety backup downloaded first.");
-      setSyncCheckMessage("Cloud copy applied to this device. A safety backup downloaded first.");
+      renderFullDataCloudPreview(cloud, `Cloud copy applied and verified: ${formatFullDataPackageSummary(restoredPackageSummary)}.`);
+      setSyncCheckMessage(`Cloud copy applied and verified: ${formatFullDataPackageSummary(restoredPackageSummary)}.`);
       return;
     }
 
-    setSyncCheckMessage("Uploading this device as the current cloud copy...");
+    setSyncCheckMessage(isAutoSync ? "Auto-sync uploading this device's complete data package..." : "Uploading this device as the current cloud copy...");
     const updatedCloud = await uploadFullDataCloudCopy(connection, cloud, syncedAt);
     renderLocalSyncStatus();
-    renderFullDataCloudPreview(updatedCloud, "This device is now the current cloud copy.");
-    setSyncCheckMessage(`Sync complete. This device is now the cloud copy at revision ${describeFullDataCloudRecord(updatedCloud).revision}.`);
-    refreshCloudBackups({ silent: true });
+    renderFullDataCloudPreview(updatedCloud, isAutoSync ? "Auto-sync saved this device's complete data package to cloud." : "This device is now the current cloud copy.");
+    setSyncCheckMessage(`${isAutoSync ? "Auto-sync complete" : "Sync complete"}. This device is now the cloud copy at revision ${describeFullDataCloudRecord(updatedCloud).revision}.`);
   }catch(e){
     saveLocalSyncStatus({
-      status: "full-sync-error",
+      status: "sync-error",
       lastRemoteStatus: "error",
       lastRemoteCheckAt: syncedAt,
       lastSyncError: e && e.message ? e.message : String(e || "Full data sync failed")
@@ -1637,6 +1752,49 @@ async function runFullDataCloudSync(){
     setSyncCheckMessage(`Sync failed: ${e && e.message ? e.message : e}`);
   }finally{
     setFullDataSyncBusy(false);
+  }
+}
+
+let autoFullDataSyncTimer = null;
+let autoFullDataSyncRunning = false;
+
+function scheduleAutoFullDataSync(reason = "auto"){
+  const config = loadSyncConfig();
+  if (config.autoSyncEnabled !== true) return;
+  if (document.hidden) return;
+  updateAutoSyncFooterStatus();
+  setSyncCheckMessage("Auto-sync scheduled...");
+  clearTimeout(autoFullDataSyncTimer);
+  autoFullDataSyncTimer = setTimeout(() => runAutoFullDataSync(reason), 1500);
+}
+
+async function runAutoFullDataSync(reason = "auto"){
+  const config = loadSyncConfig();
+  if (config.autoSyncEnabled !== true || !config.token) return;
+  if (autoFullDataSyncRunning) return;
+
+  autoFullDataSyncRunning = true;
+  const startedAt = nowIso();
+  saveLocalSyncStatus({
+    lastAutoSyncAttemptAt: startedAt,
+    lastAutoSyncReason: reason
+  });
+  try {
+    await runFullDataCloudSync({ auto: true, reason });
+    saveLocalSyncStatus({
+      lastAutoSyncAt: nowIso(),
+      lastAutoSyncReason: reason
+    });
+  } catch(e) {
+    saveLocalSyncStatus({
+      status: "auto-sync-error",
+      lastRemoteStatus: "error",
+      lastSyncError: e && e.message ? e.message : String(e || "Auto-sync failed")
+    });
+    renderLocalSyncStatus();
+    setSyncCheckMessage(`Auto-sync failed: ${e && e.message ? e.message : e}`);
+  } finally {
+    autoFullDataSyncRunning = false;
   }
 }
 
@@ -2693,12 +2851,16 @@ function loadLocalStorageJsonItem(key, label, fallback, validate){
 
 function saveLocalStorageItem(key, value, label){
   try{
+    const previousValue = storage.getItem(key);
     const cfg = getStorageSafetyConfig(key, label);
     if (cfg) {
       parseStorageJson(value);
       mirrorLocalStorageRaw(key, storage.getItem(key), label);
     }
     storage.setItem(key, value);
+    if (COMPLETE_DATA_SYNC_KEYS.has(key) && previousValue !== value) {
+      recordCompleteDataPackageChange(`${label || key}-change`);
+    }
     return true;
   }catch(e){
     warnStorageSaveFailed(label, e);
@@ -3118,6 +3280,7 @@ function saveSafetyInfoFromSettingsFields(){
 function setAppVersionBadge(){
   const el = document.getElementById("appVersion");
   if (el) el.textContent = APP_VERSION;
+  updateAutoSyncFooterStatus();
 }
 window.addEventListener("DOMContentLoaded", setAppVersionBadge);
 document.addEventListener("click", (e) => {
@@ -3513,6 +3676,44 @@ function createNewPortFromSettings(){
 }
 
 
+function closePortsManagerModal(){
+  const modal = document.getElementById("portsModal");
+  const overlay = document.getElementById("portsModalOverlay");
+  modal?.classList.add("hidden");
+  modal?.setAttribute("aria-hidden", "true");
+  overlay?.classList.add("hidden");
+}
+
+function openPortsManagerModal(openName = ""){
+  const modal = document.getElementById("portsModal");
+  const overlay = document.getElementById("portsModalOverlay");
+  const closeBtn = document.getElementById("portsModalClose");
+  if (!modal) return;
+  if (closeBtn && closeBtn.dataset.bound !== "1") {
+    closeBtn.dataset.bound = "1";
+    closeBtn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closePortsManagerModal();
+    });
+  }
+  if (overlay && overlay.dataset.bound !== "1") {
+    overlay.dataset.bound = "1";
+    overlay.addEventListener("click", closePortsManagerModal);
+  }
+  renderPortsManagerList(openName);
+  modal.classList.remove("hidden");
+  modal.setAttribute("aria-hidden", "false");
+  overlay?.classList.remove("hidden");
+  if (openName) {
+    setTimeout(() => {
+      const row = modal.querySelector("[data-port-open='1']");
+      row?.scrollIntoView({ block: "center", behavior: "smooth" });
+      row?.querySelector(".ports-name-input")?.focus({ preventScroll: true });
+    }, 60);
+  }
+}
+
 function renderPortsManagerList(openName = "") {
   const lists = Array.from(new Set([
     ...document.querySelectorAll("[data-ports-manager-list]"),
@@ -3538,7 +3739,11 @@ function renderPortsManagerList(openName = "") {
     const row = document.createElement("div");
     row.className = "ports-row st-list-card st-edit-list-row";
     row.tabIndex = 0;
-    if (String(name) === String(openName)) row.classList.add("is-editing");
+    const isOpenTarget = String(name).toLowerCase() === String(openName).toLowerCase();
+    if (isOpenTarget) {
+      row.classList.add("is-editing", "port-open-target");
+      row.dataset.portOpen = "1";
+    }
 
     const left = document.createElement("div");
     left.className = "ports-left st-list-card-main";
@@ -3747,19 +3952,19 @@ function setupPortsManagerModal() {
 
   if (!openBtn || !modal) return;
 
-  const open = () => {
-    renderPortsManagerList();
-    modal.classList.remove("hidden");
-    if (overlay) overlay.classList.remove("hidden");
-  };
-  const close = () => {
-    modal.classList.add("hidden");
-    if (overlay) overlay.classList.add("hidden");
-  };
-
-  openBtn.addEventListener("click", open);
-  if (closeBtn) closeBtn.addEventListener("click", close);
-  if (overlay) overlay.addEventListener("click", close);
+  openBtn.addEventListener("click", () => openPortsManagerModal());
+  if (closeBtn && closeBtn.dataset.bound !== "1") {
+    closeBtn.dataset.bound = "1";
+    closeBtn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closePortsManagerModal();
+    });
+  }
+  if (overlay && overlay.dataset.bound !== "1") {
+    overlay.dataset.bound = "1";
+    overlay.addEventListener("click", closePortsManagerModal);
+  }
 }
 
 function setupSettingsCardToggles(){
@@ -4527,6 +4732,7 @@ function switchToTab(tabId) {
         if (typeof planMoonPhase !== "undefined" && planMoonPhase) p.plan.moonPhase = normaliseMoonPhaseLabel(planMoonPhase.value);
         if (typeof planMoonRiseSet !== "undefined" && planMoonRiseSet) p.plan.moonRiseSet = planMoonRiseSet.value.trim();
         if (typeof planTidalCoeff !== "undefined" && planTidalCoeff) p.plan.tidalCoeff = planTidalCoeff.value.trim();
+        if (typeof planCategories !== "undefined" && planCategories) p.plan.categories = normaliseCategoryList(planCategories.value);
         if (typeof planCurrents !== "undefined" && planCurrents) p.plan.currents = planCurrents.value.trim();
         if (typeof planWeather !== "undefined" && planWeather) p.plan.weather = planWeather.value.trim();
         if (typeof planComms !== "undefined" && planComms) p.plan.comms = planComms.value.trim();
@@ -4562,6 +4768,8 @@ function switchToTab(tabId) {
   if (tabId === "planTab" && planForm?.dataset?.openingDpp !== "1") {
     try { showPassagePlanPage(); } catch {}
   }
+
+  scheduleAutoFullDataSync(`tab-${tabId || "change"}`);
 }
 
 // Position formatting helpers: decimal degrees -> dºmm.mmm'H
@@ -4672,6 +4880,7 @@ const planPortsGrid = document.getElementById("planPortsGrid");
 const planVessel = document.getElementById("planVessel");
 const planSkipper = document.getElementById("planSkipper");
 const planCrew = document.getElementById("planCrew");
+const planCategories = document.getElementById("planCategories");
 const planSunriseSet = document.getElementById("planSunriseSet");
 const planMoonPhase = document.getElementById("planMoonPhase");
 const planMoonRiseSet = document.getElementById("planMoonRiseSet");
@@ -5428,7 +5637,49 @@ function closeModal(){
 
 // --- Backup / Restore ----------------------------------------------
 
-function createDataBackupPayload(){
+function flushCurrentPlanFormToPassage(reason = "plan-form-sync"){
+  const p = getCurrentPassage();
+  if (!p || !p.plan || !planForm) return false;
+  const beforePlanJson = stableComparableJson(p.plan || {});
+  const previousPlanDate = String(p.plan?.date || "").trim();
+
+  if (typeof planDate !== "undefined" && planDate) p.plan.date = planDate.value;
+  if (typeof planTimeZone !== "undefined" && planTimeZone) p.plan.timeZone = normalisePassageTimeZone(planTimeZone.value || p.plan.timeZone);
+  if (typeof planFrom !== "undefined" && planFrom) p.plan.from = planFrom.value.trim();
+  if (typeof planTo !== "undefined" && planTo) p.plan.to = planTo.value.trim();
+  try { readTransitPortsFromForm(p); } catch(e) {}
+
+  if (typeof planVessel !== "undefined" && planVessel) p.plan.vessel = planVessel.value.trim();
+  if (typeof planSkipper !== "undefined" && planSkipper) p.plan.skipper = planSkipper.value.trim();
+  if (typeof planCrew !== "undefined" && planCrew) p.plan.crew = planCrew.value.trim();
+  if (typeof planCategories !== "undefined" && planCategories) p.plan.categories = normaliseCategoryList(planCategories.value);
+  if (typeof planSunriseSet !== "undefined" && planSunriseSet) p.plan.sunriseSet = planSunriseSet.value.trim();
+  if (typeof planMoonPhase !== "undefined" && planMoonPhase) p.plan.moonPhase = normaliseMoonPhaseLabel(planMoonPhase.value);
+  if (typeof planMoonRiseSet !== "undefined" && planMoonRiseSet) p.plan.moonRiseSet = planMoonRiseSet.value.trim();
+  if (typeof planTidalCoeff !== "undefined" && planTidalCoeff) p.plan.tidalCoeff = planTidalCoeff.value.trim();
+  if (typeof planCurrents !== "undefined" && planCurrents) p.plan.currents = planCurrents.value.trim();
+  if (typeof planWeather !== "undefined" && planWeather) p.plan.weather = planWeather.value.trim();
+  if (typeof planComms !== "undefined" && planComms) p.plan.comms = planComms.value.trim();
+
+  if (typeof readTideStationsFromForm === "function") {
+    p.plan.tideStations = readTideStationsFromForm();
+    try { ensureAutoTideStations(p); } catch(e) {}
+  }
+  if (typeof readDailySummariesFromForm === "function") {
+    p.plan.dailySummaries = readDailySummariesFromForm();
+    syncDailySummaryDatesWithPassageDate(p, previousPlanDate, p.plan.date);
+  }
+  if (typeof readDetailedPassagePlanFromForm === "function") readDetailedPassagePlanFromForm();
+  if (typeof ensureDetailedPassagePlans === "function") ensureDetailedPassagePlans(p);
+
+  if (stableComparableJson(p.plan || {}) === beforePlanJson) return false;
+  markPassageDirty(p, nowIso(), reason);
+  savePassages();
+  return true;
+}
+
+function createDataBackupPayload(options = {}){
+  if (options.flush !== false) flushCurrentPlanFormToPassage("backup-package-create");
   normalisePassagesForSync(passages);
   const payload = {
     format: DATA_BACKUP_FORMAT,
@@ -5449,7 +5700,8 @@ function createDataBackupPayload(){
       weatherAbbreviations: loadAbbrDb(),
       fuelManagement: loadFuelManagementSettings(),
       settings: {
-        logSplitRatio: storage.getItem(LOG_SPLIT_RATIO_KEY) || ""
+        logSplitRatio: storage.getItem(LOG_SPLIT_RATIO_KEY) || "",
+        weatherAbbreviationsEnabled: weatherAbbreviationsEnabled()
       },
       localSyncStatus: getLocalSyncSummary()
     }
@@ -5524,14 +5776,14 @@ function exportDppTemplatesBackup() {
   URL.revokeObjectURL(url);
 }
 
-function refreshAfterDataRestore(){
+function refreshAfterDataRestore(options = {}){
   refreshHomePassageList();
   currentPassageId = getFirstActivePassage()?.id || null;
   loadPassageIntoUI();
   refreshPortUI();
   try { injectSafetyEmergencySettingsBlock(); } catch(e) {}
   try { injectFuelManagementSettingsBlock(); } catch(e) {}
-  importDppTemplateWaypointsToLibrary();
+  if (options.importDppTemplateWaypoints !== false) importDppTemplateWaypointsToLibrary();
   renderDppTemplatesManager();
   renderDppWaypointsManager();
   try { updatePlanSummaryPanel(); } catch(e) {}
@@ -5563,8 +5815,7 @@ function restoreDataBackupObject(obj, options = {}){
   const portsPayload = obj.data.knownPorts || {};
   knownPorts = Array.isArray(portsPayload.all) ? portsPayload.all : [];
   recentPorts = Array.isArray(portsPayload.recent) ? portsPayload.recent : [];
-  cleanPortsInPlace();
-  savePorts();
+  saveLocalStorageItem(PORTS_KEY, JSON.stringify({ all: knownPorts, recent: recentPorts }), "ports");
 
   if (obj.data.safetyInfo) {
     saveLocalStorageItem(SAFETY_INFO_KEY, JSON.stringify(obj.data.safetyInfo), "Safety / Emergency Info");
@@ -5572,8 +5823,8 @@ function restoreDataBackupObject(obj, options = {}){
   if (obj.data.legacyEcSettings) {
     saveLocalStorageItem(EC_SETTINGS_KEY, JSON.stringify(obj.data.legacyEcSettings), "legacy emergency contact settings");
   }
-  if (obj.data.dppTemplates) saveDppTemplateStore(obj.data.dppTemplates);
-  if (obj.data.dppWaypoints) saveDppWaypointStore(obj.data.dppWaypoints);
+  if (obj.data.dppTemplates) saveDppTemplateStore(obj.data.dppTemplates, { preserveUpdatedAt: true });
+  if (obj.data.dppWaypoints) saveDppWaypointStore(obj.data.dppWaypoints, { preserveUpdatedAt: true });
   if (obj.data.weatherAbbreviations) {
     saveLocalStorageItem(ABBR_DB_KEY, JSON.stringify(obj.data.weatherAbbreviations), "weather abbreviations");
   }
@@ -5581,11 +5832,14 @@ function restoreDataBackupObject(obj, options = {}){
     saveFuelManagementSettings(obj.data.fuelManagement);
   }
   if (obj.data.settings && obj.data.settings.logSplitRatio) {
-    storage.setItem(LOG_SPLIT_RATIO_KEY, String(obj.data.settings.logSplitRatio));
+    saveLocalStorageItem(LOG_SPLIT_RATIO_KEY, String(obj.data.settings.logSplitRatio), "log split setting");
+  }
+  if (obj.data.settings && Object.prototype.hasOwnProperty.call(obj.data.settings, "weatherAbbreviationsEnabled")) {
+    saveLocalStorageItem(WEATHER_ABBR_ENABLED_KEY, obj.data.settings.weatherAbbreviationsEnabled === false ? "0" : "1", "weather abbreviations setting");
   }
   applyTheme(obj.data.theme || "day");
-  refreshAfterDataRestore();
-  alert(options.successMessage || "Full STEELER data backup restored successfully.");
+  refreshAfterDataRestore({ importDppTemplateWaypoints: false });
+  if (!options.silent) alert(options.successMessage || "Full STEELER data backup restored successfully.");
   return true;
 }
 
@@ -5905,6 +6159,7 @@ function clonePassagePlanForCopy(plan) {
     vessel: copy.vessel || "STEELER",
     skipper: copy.skipper || "",
     crew: copy.crew || "",
+    categories: Array.isArray(copy.categories) ? normaliseCategoryList(copy.categories) : String(copy.categories || ""),
     sunriseSet: copy.sunriseSet || "",
     moonPhase: copy.moonPhase || "",
     moonRiseSet: copy.moonRiseSet || "",
@@ -6080,6 +6335,104 @@ function getPassageDateValue(passage) {
   return passage.plan?.date || passage.createdAt?.slice(0, 10) || "";
 }
 
+function normaliseCategoryList(value){
+  const raw = Array.isArray(value)
+    ? value
+    : String(value || "").split(/[,\n;]/);
+  const seen = new Set();
+  return raw
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .filter((item) => {
+      const key = item.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function normalisePassageCategories(passage){
+  const value = passage?.plan?.categories ?? passage?.categories ?? "";
+  return normaliseCategoryList(value);
+}
+
+function formatFuelConsumption(fuelValue, nmValue){
+  const fuel = _num(fuelValue);
+  const nm = _num(nmValue);
+  if (fuel === null || nm === null || nm <= 0) return "–";
+  return `${(fuel / nm).toFixed(2)} l/NM`;
+}
+
+function getPassageEstimatedFuelText(passage){
+  const fuel = getPlanPageDetailedTotals(passage).fuel;
+  return fuel && fuel !== "–" ? fuel : "";
+}
+
+function makePortLinkHtml(name, portId = ""){
+  const cleanName = String(name || "").trim();
+  if (!cleanName) return "";
+  const port = portId ? findPortItemById(portId) : findPortItemByName(cleanName);
+  return `<button type="button" class="inline-port-link" data-port-link="${escapeHtml(port?.id || "")}" data-port-name="${escapeHtml(port ? portName(port) : cleanName)}">${escapeHtml(cleanName)}</button>`;
+}
+
+function linkKnownPortNamesInText(text){
+  const ports = (knownPorts || [])
+    .map((port) => ({ port, name: portName(port) }))
+    .filter((item) => item.name && item.name.length >= 3)
+    .sort((a, b) => b.name.length - a.name.length);
+  const source = String(text || "");
+  if (!source || !ports.length) return escapeHtml(source).replace(/\n/g, "<br>");
+  const isWordChar = (ch) => /[A-Za-z0-9À-ÿ]/.test(ch || "");
+  let html = "";
+  let index = 0;
+  while (index < source.length) {
+    let hit = null;
+    for (const item of ports) {
+      const slice = source.slice(index, index + item.name.length);
+      if (slice.toLowerCase() !== item.name.toLowerCase()) continue;
+      if (isWordChar(source[index - 1]) || isWordChar(source[index + item.name.length])) continue;
+      hit = { ...item, shown: slice };
+      break;
+    }
+    if (hit) {
+      html += `<button type="button" class="inline-port-link" data-port-link="${escapeHtml(hit.port.id || "")}" data-port-name="${escapeHtml(hit.name)}">${escapeHtml(hit.shown)}</button>`;
+      index += hit.name.length;
+    } else {
+      html += escapeHtml(source[index]);
+      index += 1;
+    }
+  }
+  return html.replace(/\n/g, "<br>");
+}
+
+function routeTextToPortLinks(passage){
+  const plan = passage?.plan || {};
+  const parts = [];
+  parts.push(makePortLinkHtml(plan.from || "", plan.fromPortId || ""));
+  (Array.isArray(plan.transitPorts) ? plan.transitPorts : []).forEach((port) => {
+    const name = typeof port === "string" ? port : port?.name;
+    const id = typeof port === "object" ? port?.portId : "";
+    if (String(name || "").trim()) parts.push(makePortLinkHtml(name, id));
+  });
+  parts.push(makePortLinkHtml(plan.to || "", plan.toPortId || ""));
+  return parts.filter(Boolean).join(" &rarr; ") || escapeHtml(getRouteNames(passage).join(" → ") || "?");
+}
+
+function openPortFromInlineLink(portId = "", portLabel = ""){
+  const port = portId ? findPortItemById(portId) : findPortItemByName(portLabel);
+  const name = port ? portName(port) : String(portLabel || "").trim();
+  if (!name) return;
+  openPortDetailsModal({
+    title: "Port Details",
+    port: port || { name },
+    allowLookup: true
+  }).then((saved) => {
+    if (!saved) return;
+    refreshPortUI();
+    try { renderPortsManagerList(portName(saved)); } catch(e) {}
+  });
+}
+
 function passageMatchesHomeFilter(passage) {
   const status = getPassageDashboardStatus(passage);
   if (homePassageFilterMode === "active") return passage.id === currentPassageId || status === "Under Way";
@@ -6094,6 +6447,7 @@ function passageMatchesHomeSearch(passage) {
     getRouteNames(passage).join(" "),
     getPassageDateValue(passage),
     getPassageDashboardStatus(passage),
+    normalisePassageCategories(passage).join(" "),
     passage.plan?.skipper || "",
     passage.plan?.crew || ""
   ].join(" ").toLowerCase();
@@ -6106,18 +6460,82 @@ function getPassageDashboardMetrics(passage) {
   const summary = status === "Complete"
     ? computePassageLogSummary(passage)
     : computeLegLogSummary(passage, legIdx);
+  const distance = summary.gLog || summary.nmG || "–";
+  const estimatedFuel = getPassageEstimatedFuelText(passage);
+  const fuelUsedText = summary.fuelUsed && summary.fuelUsed !== "–"
+    ? `${summary.fuelUsed}${estimatedFuel ? ` (${estimatedFuel} est.)` : ""}`
+    : (estimatedFuel ? `– (${estimatedFuel} est.)` : "–");
 
   return [
     { label: "Under Way", value: summary.durationText || "–" },
     { label: "Engine Hours", value: summary.ehText || "–" },
-    { label: "Fuel Used", value: summary.fuelUsed || "–" },
-    { label: "NM(G)", value: summary.gLog || summary.nmG || "–" }
+    { label: "Fuel Used", value: fuelUsedText },
+    { label: "l/NM", value: formatFuelConsumption(summary.fuelUsed, distance) },
+    { label: "NM(G)", value: distance }
   ].map(m => `
     <span class="st-metric-chip passage-metric">
       <span>${escapeHtml(m.label)}</span>
       <strong>${escapeHtml(m.value && m.value !== "undefined" ? String(m.value) : "–")}</strong>
     </span>
   `).join("");
+}
+
+function computePassageCategoryNumbers(passage){
+  const summary = computePassageLogSummary(passage);
+  const fuel = _num(summary.fuelUsed) || 0;
+  const nm = _num(summary.gLog) || 0;
+  const engineStart = _num(passage?.plan?.engineHoursStart);
+  const engineEnd = _num(passage?.finish?.engineHoursEnd);
+  const engineHours = engineStart !== null && engineEnd !== null && engineEnd >= engineStart
+    ? engineEnd - engineStart
+    : 0;
+  let underwayMinutes = 0;
+  for (let i = 0; i < getLegCount(passage); i += 1) {
+    const legMetrics = computeLegMetricsFromEntries(passage, i);
+    if (legMetrics.durationMinutes !== null) underwayMinutes += legMetrics.durationMinutes;
+  }
+  return { fuel, nm, engineHours, underwayMinutes };
+}
+
+function renderPassageCategorySummary(sourcePassages){
+  const byCategory = new Map();
+  (sourcePassages || []).forEach((passage) => {
+    const categories = normalisePassageCategories(passage);
+    if (!categories.length) return;
+    const numbers = computePassageCategoryNumbers(passage);
+    categories.forEach((category) => {
+      const existing = byCategory.get(category.toLowerCase()) || {
+        label: category,
+        passages: 0,
+        nm: 0,
+        fuel: 0,
+        engineHours: 0,
+        underwayMinutes: 0
+      };
+      existing.passages += 1;
+      existing.nm += numbers.nm;
+      existing.fuel += numbers.fuel;
+      existing.engineHours += numbers.engineHours;
+      existing.underwayMinutes += numbers.underwayMinutes;
+      byCategory.set(category.toLowerCase(), existing);
+    });
+  });
+  if (!byCategory.size) return "";
+  const cards = Array.from(byCategory.values())
+    .sort((a, b) => a.label.localeCompare(b.label))
+    .map((item) => {
+      const fuelPerNm = item.fuel > 0 && item.nm > 0 ? `${(item.fuel / item.nm).toFixed(2)} l/NM` : "–";
+      return `
+        <div class="category-summary-card">
+          <strong>${escapeHtml(item.label)}</strong>
+          <span>${item.passages} passage${item.passages === 1 ? "" : "s"}</span>
+          <span>${item.nm ? item.nm.toFixed(1) : "–"} NM · ${_fmtDurationFromMinutes(item.underwayMinutes) || "–"} UW</span>
+          <span>${item.fuel ? item.fuel.toFixed(1) : "–"} L fuel · ${item.engineHours ? item.engineHours.toFixed(1) : "–"} EH</span>
+          <span>${fuelPerNm}</span>
+        </div>
+      `;
+    }).join("");
+  return `<div class="passage-category-summary">${cards}</div>`;
 }
 
 function getPassageStatusClass(status) {
@@ -6177,15 +6595,16 @@ function refreshHomePassageList() {
     card.className = "passage-card" + (passage.id === currentPassageId ? " selected" : "");
 
     const date = getPassageDateValue(passage);
-    const routeText = getRouteNames(passage).join(" → ") || "?";
     const status = getPassageDashboardStatus(passage);
     const entriesCount = activeLogEntries(passage).length;
+    const categories = normalisePassageCategories(passage);
 
     const left = document.createElement("div");
     left.className = "passage-card-left";
     left.innerHTML = `
-      <div class="passage-card-title">${escapeHtml(routeText)}</div>
+      <div class="passage-card-title">${routeTextToPortLinks(passage)}</div>
       <div class="passage-card-meta"><span>${escapeHtml(date)}</span><span>${entriesCount} entries</span><span class="st-status-chip status-${escapeHtml(getPassageStatusClass(status))}">${escapeHtml(status)}</span></div>
+      ${categories.length ? `<div class="passage-category-chips">${categories.map(category => `<span>${escapeHtml(category)}</span>`).join("")}</div>` : ""}
     `;
 
     const summary = document.createElement("div");
@@ -6249,7 +6668,7 @@ function refreshHomePassageList() {
     };
 
     card.addEventListener("pointerdown", (e) => {
-      if (e.target.closest(".passage-copy-btn, .passage-delete-btn")) return;
+      if (e.target.closest(".passage-copy-btn, .passage-delete-btn, .inline-port-link")) return;
       clearHomeCardLongPress();
       homeCardLongPressTimer = setTimeout(() => {
         card.dataset.openedByLongPress = "1";
@@ -6261,7 +6680,7 @@ function refreshHomePassageList() {
     card.addEventListener("pointerleave", clearHomeCardLongPress);
     card.addEventListener("pointercancel", clearHomeCardLongPress);
     card.addEventListener("dblclick", (e) => {
-      if (e.target.closest(".passage-copy-btn, .passage-delete-btn")) return;
+      if (e.target.closest(".passage-copy-btn, .passage-delete-btn, .inline-port-link")) return;
       e.preventDefault();
       e.stopPropagation();
       selectHomePassage(passage, { openLog: true });
@@ -6270,7 +6689,7 @@ function refreshHomePassageList() {
     card.addEventListener("click", (e) => {
       if (card.dataset.justSwiped === "1") return;
       if (card.dataset.openedByLongPress === "1") return;
-      if (e.target.closest(".passage-copy-btn, .passage-delete-btn")) return;
+      if (e.target.closest(".passage-copy-btn, .passage-delete-btn, .inline-port-link")) return;
       selectHomePassage(passage, { openLog: false });
     });
 
@@ -6316,7 +6735,7 @@ function setupLogSplitDivider() {
     if (!rect.width) return;
     const ratio = clampLogSplitRatio(((clientX - rect.left) / rect.width) * 100);
     applyLogSplitRatio(ratio);
-    if (persist) storage.setItem(LOG_SPLIT_RATIO_KEY, String(ratio));
+    if (persist) saveLocalStorageItem(LOG_SPLIT_RATIO_KEY, String(ratio), "log split setting");
   };
 
   logSplitDivider.addEventListener("pointerdown", (e) => {
@@ -6346,7 +6765,7 @@ function setupLogSplitDivider() {
       const next = getStoredLogSplitRatio() + (e.key === "ArrowRight" ? step : -step);
       const ratio = clampLogSplitRatio(next);
       applyLogSplitRatio(ratio);
-      storage.setItem(LOG_SPLIT_RATIO_KEY, String(ratio));
+      saveLocalStorageItem(LOG_SPLIT_RATIO_KEY, String(ratio), "log split setting");
     }
   });
 
@@ -6801,6 +7220,7 @@ function createPassage() {
       vessel: "STEELER",
       skipper: "",
       crew: "",
+      categories: "",
       sunriseSet: "",
       moonPhase: "",
       moonRiseSet: "",
@@ -6865,6 +7285,7 @@ function loadPlanIntoForm(p) {
 planVessel.value = p.plan.vessel || "STEELER";
   planSkipper.value = p.plan.skipper || "";
   planCrew.value = p.plan.crew || "";
+  if (planCategories) planCategories.value = normalisePassageCategories(p).join(", ");
   planSunriseSet.value = p.plan.sunriseSet || "";
   if (planMoonPhase) {
     const d = p.plan.date || p.createdAt?.slice(0,10) || "";
@@ -7228,7 +7649,23 @@ function getDetailedPassagePlanForLeg(p, legIdx = null){
 function setDetailedPassagePlanForLeg(p, legIdx, detailed){
   ensureDetailedPassagePlans(p);
   const idx = Math.max(0, Math.min(Number(legIdx) || 0, Math.max(0, getLegCount(p) - 1)));
-  p.plan.detailedLegs[idx] = normaliseDetailedPassagePlan(detailed);
+  const previous = p.plan.detailedLegs[idx] || createBlankDetailedPassagePlan();
+  const previousHadContent = detailedPassagePlanHasContent(previous);
+  const nextDetailed = normaliseDetailedPassagePlan(detailed);
+  const nextHasContent = detailedPassagePlanHasContent(nextDetailed);
+  if (previousHadContent && !nextHasContent) {
+    const clearedAt = nowIso();
+    p.plan.dppUpdatedAt = clearedAt;
+    p.plan.dppClearedAt = clearedAt;
+    p.plan.dppClearedAtByLeg = p.plan.dppClearedAtByLeg && typeof p.plan.dppClearedAtByLeg === "object"
+      ? p.plan.dppClearedAtByLeg
+      : {};
+    p.plan.dppClearedAtByLeg[String(idx)] = clearedAt;
+  } else if (nextHasContent && p.plan.dppClearedAtByLeg && typeof p.plan.dppClearedAtByLeg === "object") {
+    p.plan.dppUpdatedAt = nowIso();
+    delete p.plan.dppClearedAtByLeg[String(idx)];
+  }
+  p.plan.detailedLegs[idx] = nextDetailed;
   if (idx === 0) p.plan.detailed = p.plan.detailedLegs[0];
   return p.plan.detailedLegs[idx];
 }
@@ -7269,9 +7706,9 @@ function loadDppTemplateStore(){
   return normaliseDppTemplateStore(stored);
 }
 
-function saveDppTemplateStore(store){
+function saveDppTemplateStore(store, options = {}){
   const clean = normaliseDppTemplateStore(store);
-  clean.updatedAt = new Date().toISOString();
+  if (!options.preserveUpdatedAt) clean.updatedAt = new Date().toISOString();
   return saveLocalStorageItem(DPP_TEMPLATES_KEY, JSON.stringify(clean), "DPP templates");
 }
 
@@ -7419,9 +7856,9 @@ function loadDppWaypointStore(){
   return normaliseDppWaypointStore(stored);
 }
 
-function saveDppWaypointStore(store){
+function saveDppWaypointStore(store, options = {}){
   const clean = normaliseDppWaypointStore(store);
-  clean.updatedAt = new Date().toISOString();
+  if (!options.preserveUpdatedAt) clean.updatedAt = new Date().toISOString();
   return saveLocalStorageItem(DPP_WAYPOINTS_KEY, JSON.stringify(clean), "DPP waypoints");
 }
 
@@ -8871,6 +9308,7 @@ function saveAbbrDb(db){
 }
 
 function applyAbbrDbToText(text, provider, category){
+  if (!weatherAbbreviationsEnabled()) return String(text ?? "");
   // v0.7.7: Flat DB — provider/category ignored.
   const db = loadAbbrDb();
   const rules = Array.isArray(db.rules) ? db.rules : [];
@@ -9224,6 +9662,7 @@ planForm.addEventListener("submit", async (e) => {
 p.plan.vessel = planVessel.value.trim();
   p.plan.skipper = planSkipper.value.trim();
   p.plan.crew = planCrew.value.trim();
+  if (planCategories) p.plan.categories = normaliseCategoryList(planCategories.value);
   p.plan.sunriseSet = planSunriseSet.value.trim();
   if (planMoonPhase) p.plan.moonPhase = normaliseMoonPhaseLabel(planMoonPhase.value);
   if (planMoonRiseSet) p.plan.moonRiseSet = planMoonRiseSet.value.trim();
@@ -9287,6 +9726,7 @@ function updatePlanSummaryPanel() {
   const moonRiseSet = p.plan.moonRiseSet || "";
   const tidalCoeff = p.plan.tidalCoeff || "";
   const tideStations = p.plan.tideStations || [];
+  const categories = normalisePassageCategories(p);
   const currents = p.plan.currents || "";
   const weather = p.plan.weather || "";
 		const comms = p.plan.comms || "";
@@ -9312,7 +9752,7 @@ function updatePlanSummaryPanel() {
 
   const tideStationsBlocks = tideStations.map(ts => {
     const stationName = (ts.name || "").trim();
-    const nameHtml = stationName ? `<p><strong>${escapeHtml(stationName)}</strong></p>` : "";
+    const nameHtml = stationName ? `<p><strong>${makePortLinkHtml(stationName)}</strong></p>` : "";
 
     const ev = Array.isArray(ts.events) && ts.events.length
       ? ts.events.slice()
@@ -9366,6 +9806,8 @@ function updatePlanSummaryPanel() {
       <div class="col plan-summary-col plan-summary-col-left">
         <div class="block plan-link" data-goto="detailedPassagePlanSection">
           <p class="section-title">ROUTE SUMMARY</p>
+          <p class="route-port-links">${routeTextToPortLinks(p)}</p>
+          ${categories.length ? `<p class="passage-category-chips">${categories.map(category => `<span>${escapeHtml(category)}</span>`).join("")}</p>` : ""}
           ${detailedWpHtml}
           <p style="margin-top:0.5rem;"><strong>Hazards:</strong> ${detailedHazardsHtml}</p>
           <p><strong>Ports of Refuge:</strong> ${detailedRefugeHtml}</p>
@@ -9374,7 +9816,7 @@ function updatePlanSummaryPanel() {
 
         <div class="block plan-link" data-goto="planComms">
           <p class="section-title">COMMS / PILOTAGE</p>
-          <p>${comms ? linkifyNoteHtml(comms) : "<em>–</em>"}</p>
+          <p>${comms ? linkKnownPortNamesInText(comms) : "<em>–</em>"}</p>
         </div>
 
         <div class="block plan-link" data-goto="planTidalCoeff">
@@ -9385,7 +9827,7 @@ function updatePlanSummaryPanel() {
 
         <div class="block plan-link" data-goto="planCurrents">
           <p class="section-title">TIDAL CURRENTS / FLOWS</p>
-          <p>${currents ? escapeHtml(currents).replace(/\n/g, "<br>") : "<em>–</em>"}</p>
+          <p>${currents ? linkKnownPortNamesInText(currents) : "<em>–</em>"}</p>
         </div>
 
         <div class="block">
@@ -9488,7 +9930,7 @@ function setupPlanSummaryIndependentScroll(){
 planSummaryPanel.addEventListener("pointerdown", holdNoteLinkTap, true);
 planSummaryPanel.addEventListener("touchstart", holdNoteLinkTap, true);
 planSummaryPanel.addEventListener("click", (e) => {
-  if (e.target.closest("a")) return;
+  if (e.target.closest("a, .inline-port-link")) return;
   const target = e.target.closest(".plan-link");
   if (!target) return;
   const fieldId = target.dataset.goto;
@@ -11143,13 +11585,18 @@ function renderLogEntries() {
     tdNotes.className = 'log-display-cell log-notes-cell';
     tdNotes.addEventListener('click', (ev) => {
       ev.stopPropagation();
+      const portLink = ev.target.closest(".inline-port-link");
+      if (portLink) {
+        openPortFromInlineLink(portLink.getAttribute("data-port-link") || "", portLink.getAttribute("data-port-name") || portLink.textContent || "");
+        return;
+      }
       if (ev.target.closest("a")) return;
       openEntryDialog(entry);
     });
 
     const notesText = document.createElement('div');
     notesText.className = 'log-notes-display';
-    notesText.innerHTML = entry.notes ? linkifyNoteHtml(entry.notes) : '—';
+    notesText.innerHTML = entry.notes ? linkKnownPortNamesInText(entry.notes) : '—';
     activateNoteLinks(notesText);
     tdNotes.appendChild(notesText);
 
@@ -11183,7 +11630,10 @@ function renderLogEntries() {
 
     tdNotes.appendChild(actions);
     tr.appendChild(tdNotes);
-    tr.addEventListener('click', () => openEntryDialog(entry));
+    tr.addEventListener('click', (ev) => {
+      if (ev.target.closest(".inline-port-link")) return;
+      openEntryDialog(entry);
+    });
 
     logEntriesContainer.appendChild(tr);
 
@@ -11201,6 +11651,7 @@ function renderLogEntries() {
       bits.push(`Engine hours: ${s.ehText}`);
       bits.push(`Fuel ${s.fuelStart}%→${s.fuelEnd}%`);
       bits.push(`Fuel used: ${s.fuelUsed}`);
+      bits.push(`l/NM: ${formatFuelConsumption(s.fuelUsed, s.nmG)}`);
       bits.push(`NM(G): ${s.nmG}`);
       bits.push(`Under Way: ${s.durationText}`);
 
@@ -11459,6 +11910,7 @@ function updateLogSummary() {
   const html = `<strong>Total:</strong>
     Engine hours: ${total.ehText} |
     Fuel Used: ${total.fuelUsed} |
+    l/NM: ${formatFuelConsumption(total.fuelUsed, total.gLog)} |
     Fuel ${total.fuelStart}%→${total.fuelEnd}% |
     NM(G): ${total.gLog} |
     Under Way: ${total.durationText}`;
@@ -11542,6 +11994,14 @@ homePassageSortBtn?.addEventListener("click", () => {
   homePassageSortMode = homePassageSortMode === "newest" ? "oldest" : "newest";
   homePassageSortBtn.textContent = homePassageSortMode === "newest" ? "Date" : "Oldest";
   refreshHomePassageList();
+});
+
+document.addEventListener("click", (ev) => {
+  const link = ev.target.closest("[data-port-link], [data-port-name]");
+  if (!link) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  openPortFromInlineLink(link.getAttribute("data-port-link") || "", link.getAttribute("data-port-name") || link.textContent || "");
 });
 
 // --- Cache / service-worker reset ----------------------------------------
@@ -11655,6 +12115,10 @@ function reorderSettingsBlocksAndInjectWx() {
               <button type="button" id="wxAbbrResetBtn" class="btn btn-secondary">Reset defaults</button>
               <button type="button" id="wxAbbrClearBtn" class="btn btn-secondary">Clear all</button>
             </div>
+            <label class="sync-check-option weather-abbr-toggle">
+              <span>Use weather abbreviations</span>
+              <span><input id="wxAbbrEnabled" type="checkbox"> Apply abbreviation rules when forecasts are fetched or previewed</span>
+            </label>
             <p class="hint">Define abbreviation / expansion rules for Met Office and Météo-France forecasts.</p>
             <div id="wxAbbrEditorWrap" class="st-stack"></div>
           </section>
@@ -11731,6 +12195,14 @@ function setupWeatherShorthandEditorUI(){
   const importBtn = document.getElementById("wxAbbrImportBtn");
   const resetBtn  = document.getElementById("wxAbbrResetBtn");
   const clearBtn  = document.getElementById("wxAbbrClearBtn");
+  const enabledToggle = document.getElementById("wxAbbrEnabled");
+  if (enabledToggle) {
+    enabledToggle.checked = weatherAbbreviationsEnabled();
+    enabledToggle.addEventListener("change", () => {
+      saveWeatherAbbreviationsEnabled(enabledToggle.checked);
+      rebuildPreview();
+    });
+  }
 
   const topRow = mk("div", { class:"st-action-row" }, [searchInp]);
 
@@ -12096,7 +12568,7 @@ function injectSafetyEmergencySettingsBlock(){
               <input id="seiEngineToSlip" type="number" min="0" step="1" placeholder="Engine Start → WP1 mins">
               <input id="seiDetailsUrl" placeholder="Published details URL">
               <label class="st-form-field"><input id="seiIncludeDetailsUrl" type="checkbox"> Include details URL in SMS</label>
-              <label class="st-form-field"><input id="seiIncludeMarineTraffic" type="checkbox"> Include MarineTraffic link in SMS</label>
+              <label class="st-form-field"><input id="seiIncludeMarineTraffic" type="checkbox"> Include AIS position search link in SMS</label>
             </div>
           </div>
 
@@ -12177,6 +12649,7 @@ function renderFuelManagementSettings(){
   const resetAtEl = document.getElementById("fuelMgmtResetAt");
   const resetLevelEl = document.getElementById("fuelMgmtResetLevel");
   const statsEl = document.getElementById("fuelMgmtStats");
+  const analyticsEl = document.getElementById("passageAnalyticsSummary");
   if (!resetAtEl || !resetLevelEl || !statsEl) return;
 
   const stats = computeFuelManagementStats();
@@ -12195,6 +12668,9 @@ function renderFuelManagementSettings(){
     <span class="st-metric-chip"><span>Fuel Bought</span><strong>${escapeHtml(bought)}</strong></span>
     <span class="st-metric-chip"><span>Avg Cost</span><strong>${escapeHtml(avg)}</strong></span>
   `;
+  if (analyticsEl) {
+    analyticsEl.innerHTML = renderPassageCategorySummary(activePassages()) || '<p class="hint">Add Passage Categories on the Plan page to see grouped mileage, fuel and engine-hour summaries here.</p>';
+  }
 }
 
 function saveFuelManagementFromSettings(fullReset = false){
@@ -12231,8 +12707,8 @@ function injectFuelManagementSettingsBlock(){
           <div class="settings-card-main">
             <span class="settings-card-icon" aria-hidden="true">FL</span>
             <div>
-              <h3>Fuel Management</h3>
-              <p>Tank level reset and simple fuel statistics.</p>
+              <h3>Passage Analytics &amp; Fuel</h3>
+              <p>Tank level, fuel use and category summaries.</p>
             </div>
           </div>
           <button type="button" id="toggleFuelManagementBtn" class="btn btn-secondary btn-small settings-toggle" data-settings-toggle>›</button>
@@ -12255,6 +12731,10 @@ function injectFuelManagementSettingsBlock(){
               <button type="button" id="fuelMgmtFullBtn" class="btn btn-primary">Reset Tank Full</button>
               <button type="button" id="fuelMgmtSaveBtn" class="btn btn-secondary">Save Tank Level</button>
             </div>
+          </section>
+          <section class="settings-panel-card st-panel st-stack">
+            <div class="st-panel-title">Passage Categories</div>
+            <div id="passageAnalyticsSummary"></div>
           </section>
         </div>
       </div>
@@ -12311,7 +12791,13 @@ if (new URLSearchParams(location.search).has("reset")) {
   loadPassageIntoUI();
   setupLogSplitDivider();
   setLogLayoutMode("split", splitViewBtn);
+  scheduleAutoFullDataSync("app-open");
 }
+
+window.addEventListener("focus", () => scheduleAutoFullDataSync("window-focus"));
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) scheduleAutoFullDataSync("foreground");
+});
 
 // Service worker registration (PWA/offline)
 if ("serviceWorker" in navigator) {
@@ -12340,11 +12826,4 @@ if ("serviceWorker" in navigator) {
       console.warn("Service worker registration failed", err);
     }
   });
-}
-
-function closePortsManagerModal(){
-  const modal = document.getElementById("portsModal");
-  const overlay = document.getElementById("portsModalOverlay");
-  if (modal) modal.classList.add("hidden");
-  if (overlay) overlay.classList.add("hidden");
 }
