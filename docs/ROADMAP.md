@@ -46,8 +46,22 @@ Each increment gets its own Testbed candidate, fixtures, regression checks and s
 
 ## Incremental replacement of spreadsheet recording
 
-Keep the spreadsheet running with manual entry while adding useful app fields incrementally. Generic summary CSV work is deferred. First step in 1.3.5-rc4: Daily Summary OOB and recorded-night/refill-interval metrics. Later: standalone daily activity, stationary engine runs, and main-worksheet fuel reconciliation (recorded use versus actual refill; Cummins/Raymarine gauge comparison). No automatic attribution of discrepancies or gauge calibration. Historical import follows agreed recording semantics.
+Keep the spreadsheet running with manual entry while adding useful app fields incrementally. Spreadsheet export is planned as part of the Passage Analytics expansion below; its scope and timing remain to be agreed. First step in 1.3.5-rc4: Daily Summary OOB and recorded-night/refill-interval metrics. Later: standalone daily activity, stationary engine runs, and main-worksheet fuel reconciliation (recorded use versus actual refill; Cummins/Raymarine gauge comparison). No automatic attribution of discrepancies or gauge calibration. Historical import follows agreed recording semantics.
 
 ## 1.4.0 staging candidate
 
 Dedicated narrative/tags, legacy migration, guarded batch import, in-app AI preview and previous-stay offer, session Undo/Redo, ERU timing, validated engine hours run and purple testbed header are implemented. Before live promotion: Bill reviews representative historical passages, performs a real AI draft after configuring server credentials, and checks offline reopening on his iPad. Continue paper-log history enrichment in reviewed batches using a fresh backup each time.
+
+## Passage Analytics as a potential Excel replacement (after v1.4.3)
+
+Bill considers the v1.4.3 Passage Analytics table a candidate to replace his working Excel spreadsheet. This is a future design and development workstream, not a commitment to replace the spreadsheet immediately or implement all features in the next release.
+
+Before implementation, review Bill’s current workbook together and identify the additional fields, calculations and workflows needed. Compare what the app already provides with what Bill still relies on Excel for, then agree priorities and a phased scope. Retain the working spreadsheet until the required functionality and results have been validated.
+
+Planned scope for discussion:
+- Additional passage and operational fields, with clear units, definitions and treatment of missing readings, ERUs, multi-leg passages and nights on board.
+- Further spreadsheet-style analysis and recording functionality, including any agreed column-order, filtering, sorting, grouping, totals and editing requirements. Decide explicitly which fields can be edited and which are calculated; preserve authoritative readings and existing records.
+- Both XLSX and CSV export. Agree exports of the current filtered/sorted view and the full dataset, column selection/order, dates, numeric types, units and totals. XLSX should open as a usable Excel table; CSV should retain readable, unambiguous values. Export is one-way and must not modify app records or the original workbook.
+- Reconcile representative passage, monthly and annual totals against the current spreadsheet, including ground/water distances, fuel, engine hours, underway time and deduplicated nights. Keep the frozen Date column and usable iPad scrolling.
+
+Acceptance: Bill can perform the agreed everyday spreadsheet tasks in the app, exported XLSX/CSV files agree with the selected records and displayed calculations, missing values remain distinct from zero, and offline operation, backup, recovery and sync remain reliable. Deliver through reviewed Testbed candidates before promotion to Live. Further discussion and dedicated time are needed before scheduling implementation.
