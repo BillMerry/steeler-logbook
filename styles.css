@@ -3890,3 +3890,30 @@ body[data-theme="night"] .analytics-table thead th, body[data-theme="night"] .an
 .narrative-preferences textarea{display:block;width:100%;box-sizing:border-box;margin-top:.4rem}
 
 .manual-log-weather { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)) !important; }
+
+/* Passage analytics: frozen date column and headers on desktop and iPad. */
+.pt-scroll { max-height: 65vh; overflow: auto; isolation: isolate; }
+.pt-table { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; }
+.pt-table th, .pt-table td { padding: 10px 12px; white-space: nowrap; text-align: right; }
+.pt-table th:first-child, .pt-table td:first-child { position: sticky; left: 0; z-index: 2; background: var(--panel, #fff); min-width: 116px; text-align: left; border-right: 2px solid var(--line, #ccc); }
+.pt-table thead th { position: sticky; top: 0; z-index: 3; background: var(--panel, #fff); }
+.pt-table thead th:first-child { z-index: 4; }
+.pt-table td:nth-child(2), .pt-table td:nth-child(3), .pt-table td:nth-child(4) { text-align: left; }
+.pt-table thead button { display: block; min-height: 44px; width: 100%; color: inherit; background: transparent; border: 0; text-align: left; cursor: pointer; }
+.pt-table thead button[aria-pressed="true"] { font-weight: bold; text-decoration: underline; }
+.pt-table tfoot { font-weight: bold; }
+.pt-filter-option { display: flex; align-items: center; gap: 12px; min-height: 44px; }
+.pt-filter-values { max-height: 40vh; overflow: auto; margin-top: 12px; }
+.pt-filter-values summary { min-height: 44px; padding: 8px; }
+.pt-filter-values input { width: 22px; height: 22px; vertical-align: middle; }
+.pt-month { margin-left: 24px; }
+.pt-month .pt-filter-option { margin-left: 24px; }
+.pt-date-range { display: flex; flex-wrap: wrap; gap: 12px; }
+.pt-date-range label { display: grid; gap: 6px; }
+.pt-filter-actions { display: flex; gap: 12px; }
+.pt-filter-actions button { min-height: 44px; }
+#ptFilterError { color: #b42318; }
+/* Grid children must shrink so the table scrolls inside the Settings card. */
+#fuelManagementPanel { grid-template-columns: minmax(0, 1fr); min-width: 0; }
+#passageAnalyticsCard, #passageAnalyticsSummary { min-width: 0; max-width: 100%; }
+.pt-scroll { width: 100%; min-width: 0; touch-action: pan-x pan-y; }

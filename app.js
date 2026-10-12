@@ -13,7 +13,7 @@ const SYNC_STATUS_KEY = "steeler_sync_status_v1";
 const SYNC_CONFIG_KEY = "steeler_sync_config_v1";
 const WEATHER_ABBR_ENABLED_KEY = "steeler_weather_abbreviations_enabled_v1";
 
-const APP_VERSION = "1.4.2";
+const APP_VERSION = "1.4.3";
 let enrichmentMigrationSuspended = false;
 const fuelTimestampCache = new WeakMap();
 const LOCAL_DATA_SCHEMA_VERSION = 1;
@@ -90,15 +90,24 @@ const STORAGE_SAFETY_CONFIG = {
   }
 };
 
+const storageNamespace = /\/STEELER-Logbook-Staging(?:\/|$)/i.test(location.pathname) ? "steeler_testbed:" : "";
+const appCachePrefix = storageNamespace ? "steeler-testbed-v" : "steeler-logbook-v";
+const appScope = new URL("./", location.href).href;
+const storageFailures = new Set();
+const storageReadBlocks = new Set();
 const storage = {
   getItem(key){
-    return localStorage.getItem(key);
+    const raw=localStorage.getItem(storageNamespace + key);
+    try { return STEELER.storageCodec.decode(raw); }
+    catch (error) { console.error('Local storage integrity check failed', key, error); return raw; }
+
   },
   setItem(key, value){
-    localStorage.setItem(key, value);
+    const isData=!!STORAGE_SAFETY_CONFIG[key] || Object.values(STORAGE_SAFETY_CONFIG).some(c=>c.mirrorKey===key);
+    localStorage.setItem(storageNamespace + key, isData ? STEELER.storageCodec.encode(value) : value);
   },
   removeItem(key){
-    localStorage.removeItem(key);
+    localStorage.removeItem(storageNamespace + key);
   }
 };
 
@@ -2771,7 +2780,21 @@ function downloadJsonPayload(payload, filenamePrefix){
   URL.revokeObjectURL(url);
 }
 
+function renderStorageWarning(){
+  let banner=document.getElementById('storageWarning');
+  if(!banner){banner=document.createElement('div');banner.id='storageWarning';banner.setAttribute('role','alert');banner.style.cssText='position:sticky;top:0;z-index:10000;background:#fff0cf;color:#592d00;padding:16px;border:2px solid #a45a00';document.body.prepend(banner);}
+  banner.hidden=!storageFailures.size&&!storageReadBlocks.size;
+  banner.textContent=storageReadBlocks.size
+    ? 'Passage data could not be read. Saving and cloud upload are blocked to protect the stored copy. Do not clear app data; arrange recovery first.'
+    : 'Some changes have NOT been saved on this device. Keep this app open and download a backup now. Do not rely on closing and reopening the app to retain these changes.';
+  if(storageFailures.size&&!storageReadBlocks.size){
+    const button=document.createElement('button');button.type='button';button.textContent='Download backup now';button.style.marginLeft='12px';
+    button.onclick=()=>downloadJsonPayload(createDataBackupPayload({flush:false,normalize:false}),'STEELER-Unsaved-recovery-backup');banner.appendChild(button);
+  }
+}
+window.addEventListener('beforeunload',event=>{if(storageFailures.size){event.preventDefault();event.returnValue='';}});
 function warnStorageSaveFailed(label, error){
+  storageFailures.add(label);renderStorageWarning();
   console.warn(`Failed to save ${label}`, error);
   if (storageSaveWarningsShown.has(label)) return;
   storageSaveWarningsShown.add(label);
@@ -2855,6 +2878,7 @@ function exportRawStorageData({ key, label, raw, error }){
 }
 
 function handleStorageReadFailure({ key, label, raw, error, fallback, validate }){
+  if(key===STORAGE_KEY){storageReadBlocks.add(key);renderStorageWarning();}
   const cfg = getStorageSafetyConfig(key, label);
   const displayLabel = cfg?.label || label || key;
   console.error(`Failed to load ${displayLabel}`, error);
@@ -2876,6 +2900,7 @@ function handleStorageReadFailure({ key, label, raw, error, fallback, validate }
           const recovered = parseStorageJson(mirrorRaw, validate);
           if (confirm(`A last-known-good copy of ${displayLabel} is available. Restore it now?`)) {
             storage.setItem(key, mirrorRaw);
+            storageReadBlocks.delete(key);renderStorageWarning();
             alert(`${displayLabel} restored from the last-known-good copy.`);
             return recovered;
           }
@@ -2896,7 +2921,8 @@ function loadLocalStorageJsonItem(key, label, fallback, validate){
   if (!raw) return fallback;
   try{
     const value = parseStorageJson(raw, validate);
-    mirrorLocalStorageRaw(key, raw, label);
+    const safety=getStorageSafetyConfig(key,label);
+    if(safety&&!storage.getItem(safety.mirrorKey))mirrorLocalStorageRaw(key, raw, label);
     return value;
   }catch(e){
     return handleStorageReadFailure({ key, label, raw, error: e, fallback, validate });
@@ -2904,16 +2930,39 @@ function loadLocalStorageJsonItem(key, label, fallback, validate){
 }
 
 function saveLocalStorageItem(key, value, label){
+  if(storageReadBlocks.has(key)){renderStorageWarning();return false;}
   try{
     const previousValue = storage.getItem(key);
+    if(previousValue===String(value)){
+      storageFailures.delete(label);storageSaveWarningsShown.delete(label);
+      if(document.getElementById("storageWarning"))renderStorageWarning();
+      return true;
+    }
     const cfg = getStorageSafetyConfig(key, label);
     if (cfg) {
       parseStorageJson(value);
       mirrorLocalStorageRaw(key, storage.getItem(key), label);
     }
-    storage.setItem(key, value);
+    try {
+      storage.setItem(key, value);
+    } catch (error) {
+      if (error?.name !== 'QuotaExceededError') throw error;
+      // Only discard redundant mirrors when their valid primary copy is still intact.
+      // Never remove canonical records or a distinct recovery copy.
+      for (const [primaryKey, safety] of Object.entries(STORAGE_SAFETY_CONFIG)) {
+        const primary = storage.getItem(primaryKey);
+        if (!primary || storage.getItem(safety.mirrorKey) !== primary) continue;
+        try { JSON.parse(primary); } catch { continue; }
+        storage.removeItem(safety.mirrorKey);
+        storage.removeItem(safety.mirrorMetaKey);
+      }
+      storage.setItem(key, value);
+    }
+    if(storage.getItem(key)!==String(value))throw new Error("Saved data did not match the data written.");
+    storageFailures.delete(label);storageSaveWarningsShown.delete(label);
+    if(document.getElementById("storageWarning"))renderStorageWarning();
     if (COMPLETE_DATA_SYNC_KEYS.has(key) && previousValue !== value) {
-      recordCompleteDataPackageChange(`${label || key}-change`);
+      try { recordCompleteDataPackageChange(`${label || key}-change`); } catch(error) { console.warn("Sync status could not be updated after successful save", error); }
     }
     return true;
   }catch(e){
@@ -3315,13 +3364,13 @@ function saveSafetyInfoFromSettingsFields(){
 
     if ("serviceWorker" in navigator){
       navigator.serviceWorker.getRegistrations()
-        .then(regs => Promise.all(regs.map(r => r.unregister())).catch(()=>[]))
-        .then(() => ("caches" in window) ? caches.keys().then(keys => Promise.all(keys.map(k => caches.delete(k)))) : null)
+        .then(regs => Promise.all(regs.filter(r=>r.scope===appScope).map(r => r.unregister())).catch(()=>[]))
+        .then(() => ("caches" in window) ? caches.keys().then(keys => Promise.all(keys.filter(k=>k.startsWith(appCachePrefix)).map(k => caches.delete(k)))) : null)
         .then(doReload)
         .catch(doReload);
     } else {
       if ("caches" in window){
-        caches.keys().then(keys => Promise.all(keys.map(k => caches.delete(k)))).then(doReload).catch(doReload);
+        caches.keys().then(keys => Promise.all(keys.filter(k=>k.startsWith(appCachePrefix)).map(k => caches.delete(k)))).then(doReload).catch(doReload);
       } else {
         doReload();
       }
@@ -4346,7 +4395,7 @@ function savePassages() {
     const saved = JSON.stringify(passages);
     const beforeSaved = storage.getItem(STORAGE_KEY);
     const persisted = saveLocalStorageItem(STORAGE_KEY, saved, "passages");
-    if (persisted) recordPassageUndo(beforeSaved, saved);
+    if (persisted) { try { recordPassageUndo(beforeSaved, saved); } catch(error) { resetPassageUndo(); console.warn("Undo history unavailable after successful save", error); } }
     return persisted;
   } catch (e) {
     console.error("Failed to save passages", e);
@@ -5720,6 +5769,7 @@ function closeModal(){
 function flushCurrentPlanFormToPassage(reason = "plan-form-sync"){
   const p = getCurrentPassage();
   if (!p || !p.plan || !planForm) return false;
+  if (!document.getElementById("planTab")?.classList.contains("active") || planForm.dataset.passageId !== p.id) return false;
   const beforePlanJson = stableComparableJson(p.plan || {});
   const previousPlanDate = String(p.plan?.date || "").trim();
 
@@ -5759,8 +5809,9 @@ function flushCurrentPlanFormToPassage(reason = "plan-form-sync"){
 }
 
 function createDataBackupPayload(options = {}){
+  if(storageReadBlocks.has(STORAGE_KEY))throw new Error("Passage data needs recovery before a backup or cloud package can be created.");
   if (options.flush !== false) flushCurrentPlanFormToPassage("backup-package-create");
-  normalisePassagesForSync(passages);
+  if(options.normalize !== false) normalisePassagesForSync(passages);
   const payload = {
     format: DATA_BACKUP_FORMAT,
     version: 1,
@@ -5889,9 +5940,18 @@ function restoreDataBackupObject(obj, options = {}){
     if (!ok) return false;
   }
 
-  passages = obj.data.passages;
+  const previousPassages=passages;
+  const wasBlocked=storageReadBlocks.delete(STORAGE_KEY);
+  passages = JSON.parse(JSON.stringify(obj.data.passages));
   normalisePassagesForSync(passages);
-  saveLocalStorageItem(STORAGE_KEY, JSON.stringify(passages), "passages");
+  if(!saveLocalStorageItem(STORAGE_KEY, JSON.stringify(passages), "passages")){
+    passages=previousPassages;
+    if(wasBlocked)storageReadBlocks.add(STORAGE_KEY);
+    renderStorageWarning();
+    alert("Restore could not save the passage data. The existing records have been retained; keep the backup file and do not continue entering new passages until storage is working.");
+    return false;
+  }
+  renderStorageWarning();
 
   const portsPayload = obj.data.knownPorts || {};
   knownPorts = Array.isArray(portsPayload.all) ? portsPayload.all : [];
@@ -5923,6 +5983,7 @@ function restoreDataBackupObject(obj, options = {}){
   loadNarrativePreferences();
   applyTheme(obj.data.theme || "day");
   refreshAfterDataRestore({ importDppTemplateWaypoints: false });
+  if(storageFailures.size){alert("Restore did not save all data successfully. Keep your backup file; do not assume this device holds a complete restored copy.");return false;}
   if (!options.silent) alert(options.successMessage || "Full STEELER data backup restored successfully.");
   return true;
 }
@@ -5946,9 +6007,18 @@ function restoreLegacyLogbookBackupObject(obj){
   );
   if (!ok) return false;
 
-  passages = obj.data.passages;
+  const previousPassages=passages;
+  const wasBlocked=storageReadBlocks.delete(STORAGE_KEY);
+  passages = JSON.parse(JSON.stringify(obj.data.passages));
   normalisePassagesForSync(passages);
-  saveLocalStorageItem(STORAGE_KEY, JSON.stringify(passages), "passages");
+  if(!saveLocalStorageItem(STORAGE_KEY, JSON.stringify(passages), "passages")){
+    passages=previousPassages;
+    if(wasBlocked)storageReadBlocks.add(STORAGE_KEY);
+    renderStorageWarning();
+    alert("Restore could not save the passage data. The existing records have been retained; keep the backup file and do not continue entering new passages until storage is working.");
+    return false;
+  }
+  renderStorageWarning();
   if (obj.data.safetyInfo) {
     try {
       saveLocalStorageItem(SAFETY_INFO_KEY, JSON.stringify(obj.data.safetyInfo), "Safety / Emergency Info");
@@ -5961,6 +6031,7 @@ function restoreLegacyLogbookBackupObject(obj){
   if (hasDppWaypoints) saveDppWaypointStore(obj.data.dppWaypoints);
   applyTheme(obj.data.theme || "day");
   refreshAfterDataRestore();
+  if(storageFailures.size){alert("Restore did not save all data successfully. Keep your backup file.");return false;}
   alert("Backup restored successfully. Ports were left unchanged.");
   return true;
 }
@@ -6670,19 +6741,7 @@ function renderPassageCategorySummary(sourcePassages, view = loadPassageAnalytic
   }).join("")}</div>`;
 }
 
-function renderPassageAnalytics(){
-  const controls = document.getElementById("passageAnalyticsControls");
-  const summary = document.getElementById("passageAnalyticsSummary");
-  if (!controls || !summary) return;
-  const view = loadPassageAnalyticsView();
-  controls.innerHTML = `<label>Group by <select id="analyticsDimension">${Object.entries(ANALYTICS_DIMENSIONS).map(([key,label]) => `<option value="${key}"${view.dimension === key ? " selected" : ""}>${label}</option>`).join("")}</select></label><fieldset><legend>Show metrics</legend>${Object.entries(ANALYTICS_METRICS).map(([key,label]) => `<label class="analytics-metric-option"><input type="checkbox" data-analytics-metric="${key}"${view.metrics.includes(key) ? " checked" : ""}> ${label}</label>`).join("")}</fieldset>`;
-  summary.innerHTML = renderPassageCategorySummary(activePassages(), view);
-  controls.onchange = () => {
-    const next = { dimension: controls.querySelector("select").value, metrics: [...controls.querySelectorAll("input:checked")].map(el => el.dataset.analyticsMetric) };
-    try { storage.setItem(PASSAGE_ANALYTICS_KEY, JSON.stringify(next)); } catch(e) { warnStorageSaveFailed("analytics preferences", e); }
-    summary.innerHTML = renderPassageCategorySummary(activePassages(), next);
-  };
-}
+function renderPassageAnalytics(){ renderPassageTable(); }
 
 function setupCategoryAutocomplete(){
   const input = document.getElementById("planCategories");
@@ -7467,6 +7526,7 @@ function createPassage() {
 }
 
 function loadPlanIntoForm(p) {
+  planForm.dataset.passageId = p.id;
   loadNarrativeEditor(p);
   p.plan.timeZone = getPassageTimeZone(p);
   planDate.value = p.plan.date || "";
@@ -10981,6 +11041,25 @@ async function openEngineStartEntryDialog(p, legIdx, entry = null) {
   });
 }
 
+function showPassageBackupOffer(p, saved){
+  // Wait for the shutdown and any emergency-contact dialogue to finish.
+  const offerWhenReady = () => {
+    if (!modalOverlay.classList.contains('hidden')) {
+      setTimeout(offerWhenReady, 200);
+      return;
+    }
+    showModal({
+      title: saved ? 'Passage complete — save a backup?' : 'Download a recovery backup',
+      bodyHtml: saved
+        ? '<p>Your passage has been saved on this device. Download a separate safety backup?</p>'
+        : '<p>Your latest changes could not be saved on this device. Download a recovery backup now and keep the app open.</p>',
+      okText: 'Download',
+      cancelText: 'Cancel',
+      onOk: () => downloadJsonPayload(createDataBackupPayload({flush:false,normalize:false}), 'STEELER-After-passage-backup')
+    });
+  };
+  setTimeout(offerWhenReady, 200);
+}
 async function openShutdownEntryDialog(p, legIdx, isFinalLeg, entry = null) {
   p.legEnds = Array.isArray(p.legEnds) ? p.legEnds : [];
   const prev = entry ? parseShutdownFromNotes(entry) : (p.legEnds[legIdx] || {});
@@ -11045,7 +11124,8 @@ async function openShutdownEntryDialog(p, legIdx, isFinalLeg, entry = null) {
           markLogEntryDirty(newEntry, p);
           p.entries.unshift(newEntry);
         }
-								savePassages(); requestScrollToNewestLogEntry(); renderLogEntries(); refreshHomePassageList(); updatePassageHeader(); updateLogSummary();
+								const shutdownSaved=savePassages(); requestScrollToNewestLogEntry(); renderLogEntries(); refreshHomePassageList(); updatePassageHeader(); updateLogSummary();
+        if(isFinalLeg&&!entry)showPassageBackupOffer(p,shutdownSaved);
 								
 								try{
 																if (confirm("Notify Emergency Contact of safe arrival?")){
@@ -12200,6 +12280,7 @@ addEntryBtn.addEventListener("click", () => addLogEntry());
 // --- Load passage into UI -----------------------------------------
 
 function loadPassageIntoUI() {
+  const backupOffer=document.getElementById("passageBackupOffer");if(backupOffer)backupOffer.hidden=backupOffer.dataset.passageId!==currentPassageId;
   const p = getCurrentPassage();
   if (!p) {
     planForm?.reset();
@@ -12273,11 +12354,11 @@ async function resetPwaCache({ silent=false } = {}) {
   try {
     if ("serviceWorker" in navigator) {
       const regs = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(regs.map(r => r.unregister()));
+      await Promise.all(regs.filter(r=>r.scope===appScope).map(r => r.unregister()));
     }
     if (window.caches && caches.keys) {
       const keys = await caches.keys();
-      await Promise.all(keys.map(k => caches.delete(k)));
+      await Promise.all(keys.filter(k=>k.startsWith(appCachePrefix)).map(k => caches.delete(k)));
     }
   } catch (err) {
     console.warn("resetPwaCache failed:", err);
@@ -13185,7 +13266,7 @@ function injectFuelManagementSettingsBlock(){
           <details id="passageAnalyticsCard" class="settings-panel-card st-panel analytics-disclosure">
             <summary class="st-panel-title">Passage Analytics</summary>
             <div id="passageAnalyticsControls"></div>
-            <p class="hint">Average speed uses distance ÷ under-way time for legs with both readings. Nights use their OOB dates for year/month grouping and count once within each group. Other metrics use passage dates. Groups can overlap when passages share nights or categories. View choices are saved on this device.</p>
+            <p class="hint">Average speed uses distance ÷ under-way time for legs with both readings. Date filters select passages by their start date. Nights include completed OOB nights belonging to those passages; the total counts shared nights once. Blank metrics mean no reading. Filter Under way in minutes. Scroll sideways for more columns. View choices are saved on this device.</p>
             <div id="passageAnalyticsSummary"></div>
           </details>
         </div>

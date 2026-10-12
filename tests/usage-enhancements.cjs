@@ -10,7 +10,7 @@ const chromium = process.env.DOM_TEST ? require('./dom-harness.cjs') : require('
   page.on('pageerror', e => errors.push(e.message));
   await page.goto(process.env.TEST_URL || (process.env.TEST_BASE_URL || 'http://127.0.0.1:8765'));
   await page.waitForFunction(() => typeof renderPassageAnalytics === 'function');
-  assert.equal(await page.evaluate(() => APP_VERSION), '1.4.2');
+  assert.equal(await page.evaluate(() => APP_VERSION), '1.4.3');
   const syncDisplay = await page.evaluate(() => {
     saveLocalSyncStatus({lastObservedFullSyncAt:'2026-10-06T07:22:00Z',lastObservedFullSyncDeviceId:'old-device',lastObservedFullSyncDeviceName:'Old device'});
     saveFullDataCloudStatus('synced',{record:{recordId:FULL_DATA_SYNC_RECORD_ID,serverRevision:9,clientUpdatedAt:'2026-10-06T07:30:00Z',lastChangedDeviceId:'new-device',lastChangedDeviceName:'New device',payload:{packageHash:'test',appVersion:APP_VERSION}}});
@@ -132,7 +132,7 @@ const chromium = process.env.DOM_TEST ? require('./dom-harness.cjs') : require('
     result.chips=document.querySelectorAll('#fuelMgmtStats .st-metric-chip').length;
     result.openingHidden=document.getElementById('fuelOpeningBalance').hidden;
     result.noRefillNights=!document.getElementById('overnightStats').textContent.includes('refill');
-    result.nightsOption=!!document.querySelector('[data-analytics-metric="nights"]');
+    result.nightsOption=!!document.querySelector('[data-pt-sort="nights"]');
     return result;
   });
   assert.equal(fuel.rows.length,6);
