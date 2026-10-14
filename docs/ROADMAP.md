@@ -65,3 +65,7 @@ Planned scope for discussion:
 - Reconcile representative passage, monthly and annual totals against the current spreadsheet, including ground/water distances, fuel, engine hours, underway time and deduplicated nights. Keep the frozen Date column and usable iPad scrolling.
 
 Acceptance: Bill can perform the agreed everyday spreadsheet tasks in the app, exported XLSX/CSV files agree with the selected records and displayed calculations, missing values remain distinct from zero, and offline operation, backup, recovery and sync remain reliable. Deliver through reviewed Testbed candidates before promotion to Live. Further discussion and dedicated time are needed before scheduling implementation.
+
+## Next development cycle: retrospective leg editing
+
+Review adding a transit port to an existing completed passage. Offer a review of existing entries against the new leg boundaries rather than silently retaining or redistributing assignments. Flag entries after their leg's shutdown, validate edited date/time values, and ensure explicitly recorded slip/dock events are recognised. Recompute summaries from reviewed assignments without altering authoritative distance, fuel or engine readings. Regression examples: 9 July, 6 July and 29 May 2026, identified in the 14 October backup. Deferred at Bill's request while the dataset is corrected separately.
