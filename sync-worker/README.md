@@ -60,3 +60,20 @@ The token should be stored as a Worker secret named `SYNC_API_TOKEN`.
 ## Important
 
 This Worker stores complete STEELER data packages and recent recovery backups. The app decides whether to upload this device's full package or ask the user to choose between this device and the cloud copy.
+
+## Production service — 15 October 2026
+
+The deployed service uses D1 `steeler_logbook_sync_staging`
+(`e71fb407-9072-45f8-bdc0-500936e54470`). Despite the historical name, this
+is the existing Live database. Do not substitute the older
+`steeler_logbook_sync` database when deploying.
+
+Worker version `43aa12ba-9f2a-40e9-8dcc-868f7b7b8855` reduces CPU work on
+record pulls. D1 validates the stored JSON and extracts the device name;
+the Worker forwards the payload unchanged rather than parsing and pretty
+printing the full backup. This addresses observed `exceededCpu` / HTTP 503
+failures with the 2.7 MB live record. No database migration or app update is
+required. Deployment used `wrangler deploy --keep-vars`.
+
+Regression check (Node with built-in SQLite):
+`node tests/sync-worker-pull.mjs` from the repository root.

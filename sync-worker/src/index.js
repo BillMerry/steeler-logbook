@@ -190,33 +190,41 @@ async function handlePull(request, env) {
 
   const result = await env.SYNC_DB.prepare(`
     SELECT record_id, record_type, payload_json, deleted, schema_version,
-           client_updated_at, server_updated_at, server_revision, last_changed_device_id
+           client_updated_at, server_updated_at, server_revision, last_changed_device_id,
+           json_valid(payload_json) AS payload_valid,
+           CASE WHEN json_valid(payload_json) THEN
+             COALESCE(NULLIF(json_extract(payload_json, '$.deviceName'), ''),
+                      json_extract(payload_json, '$.backup.exportedByDeviceName'), '')
+           ELSE '' END AS device_name
     FROM sync_records
     WHERE ${clauses.join(" AND ")}
     ORDER BY server_revision ASC
     LIMIT ?
   `).bind(...bindings).all();
 
-  const records = (result.results || []).map((row) => {
-    const payload = JSON.parse(row.payload_json);
-    return {
+  const rows = result.results || [];
+  if (rows.some((row) => row.payload_valid !== 1)) {
+    return errorResponse("Cloud record payload could not be read.", 500);
+  }
+  // D1 validates the stored JSON. Forward it unchanged instead of parsing and
+  // serialising the entire logbook again inside the Worker's CPU allowance.
+  const records = rows.map((row) => {
+    const metadata = JSON.stringify({
       recordId: row.record_id,
       recordType: row.record_type,
-      payload,
       deleted: row.deleted === 1,
       schemaVersion: row.schema_version,
       clientUpdatedAt: row.client_updated_at,
       serverUpdatedAt: row.server_updated_at,
       serverRevision: row.server_revision,
       lastChangedDeviceId: row.last_changed_device_id,
-      lastChangedDeviceName: payload.deviceName || payload.backup?.exportedByDeviceName || ""
-    };
+      lastChangedDeviceName: row.device_name || ""
+    });
+    return `${metadata.slice(0, -1)},"payload":${row.payload_json}}`;
   });
-
-  return jsonResponse({
-    ok: true,
-    records,
-    serverRevision: records.length ? records[records.length - 1].serverRevision : await getCurrentRevision(env)
+  const revision = rows.length ? rows[rows.length - 1].server_revision : await getCurrentRevision(env);
+  return new Response(`{"ok":true,"records":[${records.join(",")}],"serverRevision":${JSON.stringify(revision)}}`, {
+    headers: JSON_HEADERS
   });
 }
 
